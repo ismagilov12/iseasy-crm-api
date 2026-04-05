@@ -1,6 +1,5 @@
 {
-  "rewrites": [
-    { "source": "/api/debug", "destination": "/api/debug" },
-    { "source": "/(.*)", "destination": "/api/index" }
-  ]
+      "rewrites": [
+                { "source": "/:path((?!api/debug).*)", "destination": "/api/index" }
+      ]
 }
