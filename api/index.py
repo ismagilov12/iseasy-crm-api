@@ -211,12 +211,18 @@ async def webhook_receive(request: Request):
     data = json.loads(body)
 
     for entry in data.get("entry", []):
+        # Direct Messages
         for messaging in entry.get("messaging", []):
             sender_id = messaging.get("sender", {}).get("id", "")
             message = messaging.get("message", {})
 
             if message and sender_id != META_PAGE_ID:
                 await process_incoming_message(sender_id, message)
+
+        # Comments on posts
+        for change in entry.get("changes", []):
+            if change.get("field") == "comments":
+                await process_incoming_comment(change.get("value", {}))
 
     return {"status": "ok"}
 
@@ -652,6 +658,113 @@ async def update_client(client_id: int, request: Request):
     body = await request.json()
     body["updated_at"] = datetime.utcnow().isoformat()
     return await db_update("clients", body, {"id": client_id})
+
+
+
+
+# ═══════════════════════════════════════
+#  INSTAGRAM COMMENTS
+# ═══════════════════════════════════════
+
+async def process_incoming_comment(value: dict):
+    comment_id = value.get("id", "")
+    media_id = value.get("media", {}).get("id", "")
+    from_user = value.get("from", {})
+    user_id = from_user.get("id", "")
+    username = from_user.get("username", "")
+    text = value.get("text", "")
+    parent_id = value.get("parent_id", "")
+
+    if user_id == INSTAGRAM_BUSINESS_ID:
+        return
+
+    try:
+        await db_insert("instagram_comments", {
+            "instagram_comment_id": comment_id,
+            "instagram_media_id": media_id,
+            "instagram_user_id": user_id,
+            "username": username,
+            "text": text,
+            "parent_comment_id": parent_id,
+            "is_reply": bool(parent_id),
+        })
+    except Exception:
+        pass
+
+
+async def reply_to_comment(comment_id: str, text: str):
+    if not META_ACCESS_TOKEN:
+        return {"status": "no_token"}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://graph.instagram.com/v21.0/{comment_id}/replies",
+            json={"message": text},
+            headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+        )
+
+    result = resp.json()
+
+    try:
+        await db_insert("instagram_comments", {
+            "instagram_comment_id": result.get("id", f"reply_{comment_id}"),
+            "instagram_media_id": "",
+            "instagram_user_id": INSTAGRAM_BUSINESS_ID,
+            "username": "iseasy",
+            "text": text,
+            "parent_comment_id": comment_id,
+            "is_reply": True,
+        })
+    except Exception:
+        pass
+
+    return result
+
+
+# ═══════════════════════════════════════
+#  API — COMMENTS
+# ═══════════════════════════════════════
+
+@app.get("/api/comments")
+async def list_comments(limit: int = 50, offset: int = 0):
+    return await db_select(
+        "instagram_comments",
+        order="created_at.desc",
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/comments/by-media/{media_id}")
+async def comments_by_media(media_id: str):
+    return await db_select(
+        "instagram_comments",
+        filters={"instagram_media_id": media_id},
+        order="created_at.asc",
+    )
+
+
+@app.post("/api/comments/{comment_id}/reply")
+async def api_reply_to_comment(comment_id: str, request: Request):
+    body = await request.json()
+    text = body.get("text", "")
+    if not text:
+        raise HTTPException(status_code=400, detail="Reply text is required")
+    result = await reply_to_comment(comment_id, text)
+    return {"ok": True, "result": result}
+
+
+@app.delete("/api/comments/{comment_id}")
+async def delete_comment(comment_id: str):
+    if not META_ACCESS_TOKEN:
+        raise HTTPException(status_code=400, detail="No access token")
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"https://graph.instagram.com/v21.0/{comment_id}",
+            headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+        )
+    await db_delete("instagram_comments", {"instagram_comment_id": comment_id})
+    return {"ok": True, "result": resp.json()}
 
 
 # ═══════════════════════════════════════
