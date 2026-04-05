@@ -1,12 +1,14 @@
 """
 IS EASY ChatBot CRM — Backend (FastAPI on Vercel)
 Интеграция с Instagram Direct + управление заказами
+Lightweight version: direct httpx REST calls to Supabase (no supabase-py)
 """
 
 import os
 import json
 import hmac
 import hashlib
+import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -14,14 +16,11 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import httpx
-from supabase import create_client, Client
 
-# ── Supabase ──
+# ── Supabase config ──
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-
-def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
 # ── Meta / Instagram ──
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
@@ -30,7 +29,110 @@ INSTAGRAM_BUSINESS_ID = os.getenv("INSTAGRAM_BUSINESS_ID", "")
 WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "iseasy_chatbot_2024")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 
-app = FastAPI(title="IS EASY ChatBot CRM", version="1.0.0")
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+# ── Lightweight Supabase REST helper ──
+
+def _h(**extra) -> dict:
+    """Merge base headers with extras."""
+    return {**HEADERS, **extra}
+
+
+async def db_select(
+    table: str,
+    columns: str = "*",
+    filters: dict | None = None,
+    order: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+    single: bool = False,
+    maybe_single: bool = False,
+    count: bool = False,
+    or_filter: str = "",
+    gt: dict | None = None,
+):
+    """SELECT from Supabase PostgREST."""
+    params = {"select": columns}
+    if filters:
+        for col, val in filters.items():
+            params[col] = f"eq.{val}"
+    if gt:
+        for col, val in gt.items():
+            params[col] = f"gt.{val}"
+    if or_filter:
+        params["or"] = f"({or_filter})"
+    if order:
+        params["order"] = order
+    if limit:
+        params["limit"] = str(limit)
+    if offset:
+        params["offset"] = str(offset)
+
+    hdrs = dict(HEADERS)
+    if single or maybe_single:
+        hdrs["Accept"] = "application/json"
+    if count:
+        hdrs["Prefer"] = "count=exact"
+        hdrs["Range-Unit"] = "items"
+        hdrs["Range"] = "0-0"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{REST_URL}/{table}", params=params, headers=hdrs)
+
+    if count:
+        cr = resp.headers.get("content-range", "")
+        total = int(cr.split("/")[-1]) if "/" in cr else 0
+        return {"data": resp.json(), "count": total}
+
+    data = resp.json()
+
+    if single:
+        if isinstance(data, list):
+            if len(data) == 0:
+                raise HTTPException(status_code=404, detail="Not found")
+            return data[0]
+        return data
+
+    if maybe_single:
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
+
+    return data
+
+
+async def db_insert(table: str, data: dict | list):
+    """INSERT into Supabase."""
+    hdrs = _h(Prefer="return=representation")
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{REST_URL}/{table}", json=data, headers=hdrs
+        )
+    result = resp.json()
+    return result
+
+
+async def db_update(table: str, data: dict, filters: dict):
+    """UPDATE in Supabase."""
+    params = {}
+    for col, val in filters.items():
+        params[col] = f"eq.{val}"
+    hdrs = _h(Prefer="return=representation")
+    async with httpx.AsyncClient() as client:
+        resp = await client.patch(
+            f"{REST_URL}/{table}", json=data, params=params, headers=hdrs
+        )
+    return resp.json()
+
+
+# ── FastAPI app ──
+
+app = FastAPI(title="IS EASY ChatBot CRM", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,17 +144,39 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════
-#  HEALTH CHECK
+#  HEALTH CHECK + DEBUG
 # ═══════════════════════════════════════
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "app": "IS EASY CRM API", "version": "1.0.0"}
+    return {"status": "ok", "app": "IS EASY CRM API", "version": "2.0.0"}
 
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/debug")
+async def debug():
+    """Debug endpoint — проверка подключения к Supabase."""
+    info = {
+        "supabase_url_set": bool(SUPABASE_URL),
+        "supabase_url_prefix": SUPABASE_URL[:30] if SUPABASE_URL else "EMPTY",
+        "supabase_key_set": bool(SUPABASE_KEY),
+        "supabase_key_len": len(SUPABASE_KEY),
+        "rest_url": REST_URL[:50] if REST_URL else "EMPTY",
+    }
+    try:
+        data = await db_select("products", columns="id,name", limit=2)
+        info["supabase_ok"] = True
+        info["products"] = data if isinstance(data, list) else []
+    except Exception as e:
+        info["supabase_ok"] = False
+        info["error"] = str(e)
+        info["error_type"] = type(e).__name__
+        info["traceback"] = traceback.format_exc()
+    return info
 
 
 # ═══════════════════════════════════════
@@ -76,7 +200,6 @@ async def webhook_receive(request: Request):
     """Приём сообщений из Instagram Direct (POST)."""
     body = await request.body()
 
-    # Проверка подписи от Meta
     if META_APP_SECRET:
         signature = request.headers.get("X-Hub-Signature-256", "")
         expected = "sha256=" + hmac.new(
@@ -87,7 +210,6 @@ async def webhook_receive(request: Request):
 
     data = json.loads(body)
 
-    # Обработка входящих сообщений
     for entry in data.get("entry", []):
         for messaging in entry.get("messaging", []):
             sender_id = messaging.get("sender", {}).get("id", "")
@@ -101,12 +223,10 @@ async def webhook_receive(request: Request):
 
 async def process_incoming_message(sender_id: str, message: dict):
     """Обработка входящего сообщения из Instagram."""
-    sb = get_supabase()
     message_id = message.get("mid", "")
     text = message.get("text", "")
     attachments = message.get("attachments", [])
 
-    # Определяем тип сообщения
     msg_type = "text"
     media_url = ""
     if attachments:
@@ -122,22 +242,23 @@ async def process_incoming_message(sender_id: str, message: dict):
             msg_type = "voice"
             media_url = att.get("payload", {}).get("url", "")
 
-    # Получаем или создаём разговор
-    conv = sb.table("conversations").select("*").eq(
-        "instagram_user_id", sender_id
-    ).maybe_single().execute()
+    conv = await db_select(
+        "conversations",
+        filters={"instagram_user_id": sender_id},
+        maybe_single=True,
+    )
 
-    if conv.data:
-        conversation_id = conv.data["id"]
-        sb.table("conversations").update({
+    if conv:
+        conversation_id = conv["id"]
+        await db_update("conversations", {
             "last_message_text": text[:200] if text else f"[{msg_type}]",
             "last_message_at": datetime.utcnow().isoformat(),
-            "unread_count": conv.data.get("unread_count", 0) + 1,
+            "unread_count": conv.get("unread_count", 0) + 1,
             "updated_at": datetime.utcnow().isoformat(),
-        }).eq("id", conversation_id).execute()
+        }, {"id": conversation_id})
     else:
         profile = await get_instagram_profile(sender_id)
-        new_conv = sb.table("conversations").insert({
+        new_conv = await db_insert("conversations", {
             "instagram_user_id": sender_id,
             "instagram_username": profile.get("username", ""),
             "client_name": profile.get("name", f"User {sender_id[-4:]}"),
@@ -145,30 +266,30 @@ async def process_incoming_message(sender_id: str, message: dict):
             "last_message_text": text[:200] if text else f"[{msg_type}]",
             "last_message_at": datetime.utcnow().isoformat(),
             "unread_count": 1,
-        }).execute()
-        conversation_id = new_conv.data[0]["id"]
+        })
+        conversation_id = new_conv[0]["id"]
 
-        # Автосоздание клиента
-        settings = sb.table("bot_settings").select("value").eq(
-            "key", "order_flow"
-        ).maybe_single().execute()
-        if settings.data and settings.data["value"].get("auto_create_client"):
-            sb.table("clients").insert({
+        settings = await db_select(
+            "bot_settings",
+            columns="value",
+            filters={"key": "order_flow"},
+            maybe_single=True,
+        )
+        if settings and settings["value"].get("auto_create_client"):
+            await db_insert("clients", {
                 "name": profile.get("name", profile.get("username", "")),
-            }).execute()
+            })
 
-    # Сохраняем сообщение
-    sb.table("messages").insert({
+    await db_insert("messages", {
         "conversation_id": conversation_id,
         "instagram_message_id": message_id,
         "direction": "incoming",
         "message_type": msg_type,
         "content": text,
         "media_url": media_url,
-    }).execute()
+    })
 
-    # Автоответ (если включён)
-    await maybe_auto_reply(sb, sender_id, conversation_id)
+    await maybe_auto_reply(sender_id, conversation_id)
 
 
 async def get_instagram_profile(user_id: str) -> dict:
@@ -191,35 +312,38 @@ async def get_instagram_profile(user_id: str) -> dict:
     return {"username": "", "name": f"User {user_id[-4:]}"}
 
 
-async def maybe_auto_reply(sb: Client, recipient_id: str, conversation_id: int):
+async def maybe_auto_reply(recipient_id: str, conversation_id: int):
     """Отправляет автоответ, если он включён в настройках."""
-    settings = sb.table("bot_settings").select("value").eq(
-        "key", "auto_reply"
-    ).maybe_single().execute()
+    settings = await db_select(
+        "bot_settings",
+        columns="value",
+        filters={"key": "auto_reply"},
+        maybe_single=True,
+    )
 
-    if not settings.data:
+    if not settings:
         return
 
-    config = settings.data["value"]
+    config = settings["value"]
     if not config.get("enabled"):
         return
 
     message_text = config.get("message", "Дякуємо за повідомлення!")
-    await send_instagram_message(sb, recipient_id, message_text, conversation_id)
+    await send_instagram_message(recipient_id, message_text, conversation_id)
 
 
 async def send_instagram_message(
-    sb: Client, recipient_id: str, text: str, conversation_id: Optional[int] = None
+    recipient_id: str, text: str, conversation_id: Optional[int] = None
 ):
     """Отправка сообщения в Instagram Direct через Graph API."""
     if not META_ACCESS_TOKEN or not META_PAGE_ID:
         if conversation_id:
-            sb.table("messages").insert({
+            await db_insert("messages", {
                 "conversation_id": conversation_id,
                 "direction": "outgoing",
                 "message_type": "text",
                 "content": text,
-            }).execute()
+            })
         return {"status": "saved_locally"}
 
     async with httpx.AsyncClient() as client:
@@ -235,13 +359,13 @@ async def send_instagram_message(
     result = resp.json()
 
     if conversation_id:
-        sb.table("messages").insert({
+        await db_insert("messages", {
             "conversation_id": conversation_id,
             "instagram_message_id": result.get("message_id", ""),
             "direction": "outgoing",
             "message_type": "text",
             "content": text,
-        }).execute()
+        })
 
     return result
 
@@ -260,56 +384,57 @@ async def list_conversations(
     offset: int = 0,
 ):
     """Список разговоров для CRM-панели."""
-    sb = get_supabase()
-    query = sb.table("conversations").select("*").eq("status", status)
-
+    filters = {"status": status}
     if funnel:
-        query = query.eq("funnel", funnel)
+        filters["funnel"] = funnel
     if channel and channel != "all":
-        query = query.eq("channel", channel)
-    if search:
-        query = query.or_(
-            f"client_name.ilike.%{search}%,instagram_username.ilike.%{search}%"
-        )
+        filters["channel"] = channel
 
-    result = query.order("last_message_at", desc=True).range(
-        offset, offset + limit - 1
-    ).execute()
-    return result.data
+    or_filter = ""
+    if search:
+        or_filter = f"client_name.ilike.%{search}%,instagram_username.ilike.%{search}%"
+
+    return await db_select(
+        "conversations",
+        filters=filters,
+        or_filter=or_filter,
+        order="last_message_at.desc",
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation(conv_id: int):
     """Детали разговора."""
-    sb = get_supabase()
-    result = sb.table("conversations").select("*").eq(
-        "id", conv_id
-    ).single().execute()
-    return result.data
+    return await db_select("conversations", filters={"id": conv_id}, single=True)
 
 
 @app.patch("/api/conversations/{conv_id}")
 async def update_conversation(conv_id: int, request: Request):
     """Обновление разговора (теги, заметки, статус, воронка, назначение)."""
-    sb = get_supabase()
     body = await request.json()
     body["updated_at"] = datetime.utcnow().isoformat()
-    result = sb.table("conversations").update(body).eq(
-        "id", conv_id
-    ).execute()
-    return result.data
+    return await db_update("conversations", body, {"id": conv_id})
 
 
 @app.post("/api/conversations/{conv_id}/read")
 async def mark_conversation_read(conv_id: int):
     """Пометить разговор как прочитанный."""
-    sb = get_supabase()
-    sb.table("conversations").update({"unread_count": 0}).eq(
-        "id", conv_id
-    ).execute()
-    sb.table("messages").update({"is_read": True}).eq(
-        "conversation_id", conv_id
-    ).eq("direction", "incoming").eq("is_read", False).execute()
+    await db_update("conversations", {"unread_count": 0}, {"id": conv_id})
+    params = {
+        "conversation_id": f"eq.{conv_id}",
+        "direction": "eq.incoming",
+        "is_read": "eq.false",
+    }
+    hdrs = _h(Prefer="return=minimal")
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"{REST_URL}/messages",
+            json={"is_read": True},
+            params=params,
+            headers=hdrs,
+        )
     return {"ok": True}
 
 
@@ -320,37 +445,36 @@ async def mark_conversation_read(conv_id: int):
 @app.get("/api/conversations/{conv_id}/messages")
 async def list_messages(conv_id: int, limit: int = 100, offset: int = 0):
     """Список сообщений в разговоре."""
-    sb = get_supabase()
-    result = sb.table("messages").select("*").eq(
-        "conversation_id", conv_id
-    ).order("created_at", desc=False).range(offset, offset + limit - 1).execute()
-    return result.data
+    return await db_select(
+        "messages",
+        filters={"conversation_id": conv_id},
+        order="created_at.asc",
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.post("/api/conversations/{conv_id}/messages")
 async def send_message(conv_id: int, request: Request):
     """Отправить сообщение клиенту."""
-    sb = get_supabase()
     body = await request.json()
     text = body.get("text", "")
 
     if not text:
         raise HTTPException(status_code=400, detail="Message text is required")
 
-    conv = sb.table("conversations").select("*").eq(
-        "id", conv_id
-    ).single().execute()
+    conv = await db_select("conversations", filters={"id": conv_id}, single=True)
 
     result = await send_instagram_message(
-        sb, conv.data["instagram_user_id"], text, conv_id
+        conv["instagram_user_id"], text, conv_id
     )
 
-    sb.table("conversations").update({
+    await db_update("conversations", {
         "last_message_text": text[:200],
         "last_message_at": datetime.utcnow().isoformat(),
         "last_message_dir": "out",
         "updated_at": datetime.utcnow().isoformat(),
-    }).eq("id", conv_id).execute()
+    }, {"id": conv_id})
 
     return {"ok": True, "result": result}
 
@@ -362,55 +486,52 @@ async def send_message(conv_id: int, request: Request):
 @app.get("/api/orders")
 async def list_orders(status: str = "", limit: int = 50, offset: int = 0):
     """Список заказов."""
-    sb = get_supabase()
-    query = sb.table("orders").select("*")
+    filters = {}
     if status:
-        query = query.eq("status", status)
-    result = query.order("created_at", desc=True).range(
-        offset, offset + limit - 1
-    ).execute()
-    return result.data
+        filters["status"] = status
+    return await db_select(
+        "orders",
+        filters=filters,
+        order="created_at.desc",
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.post("/api/orders")
 async def create_order(request: Request):
     """Создать заказ."""
-    sb = get_supabase()
     body = await request.json()
-    result = sb.table("orders").insert(body).execute()
-    return result.data
+    return await db_insert("orders", body)
 
 
 @app.patch("/api/orders/{order_id}")
 async def update_order(order_id: int, request: Request):
     """Обновить заказ."""
-    sb = get_supabase()
     body = await request.json()
     body["updated_at"] = datetime.utcnow().isoformat()
-    result = sb.table("orders").update(body).eq("id", order_id).execute()
-    return result.data
+    return await db_update("orders", body, {"id": order_id})
 
 
 @app.post("/api/orders/{order_id}/notify")
 async def notify_order(order_id: int):
     """Отправить клиенту уведомление о статусе заказа."""
-    sb = get_supabase()
-    order = sb.table("orders").select("*").eq(
-        "id", order_id
-    ).single().execute()
+    order = await db_select("orders", filters={"id": order_id}, single=True)
 
-    if not order.data:
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    conv = sb.table("conversations").select("*").eq(
-        "client_name", order.data["client"]
-    ).maybe_single().execute()
+    conv = await db_select(
+        "conversations",
+        filters={"client_name": order["client"]},
+        maybe_single=True,
+    )
 
-    if not conv.data:
+    if not conv:
         return {"ok": False, "error": "Conversation not found"}
 
-    status = order.data.get("status", "")
-    ttn = order.data.get("ttn", "")
+    status = order.get("status", "")
+    ttn = order.get("ttn", "")
 
     messages = {
         "new": "Ваше замовлення оформлено! Очікуйте на підтвердження",
@@ -422,7 +543,7 @@ async def notify_order(order_id: int):
 
     text = messages.get(status, f"Статус замовлення: {status}")
     await send_instagram_message(
-        sb, conv.data["instagram_user_id"], text, conv.data["id"]
+        conv["instagram_user_id"], text, conv["id"]
     )
 
     return {"ok": True, "message_sent": text}
@@ -435,11 +556,11 @@ async def notify_order(order_id: int):
 @app.get("/api/products")
 async def list_products():
     """Список товаров."""
-    sb = get_supabase()
-    result = sb.table("products").select("*").eq(
-        "is_active", True
-    ).order("created_at", desc=True).execute()
-    return result.data
+    return await db_select(
+        "products",
+        filters={"is_active": True},
+        order="created_at.desc",
+    )
 
 
 # ═══════════════════════════════════════
@@ -449,23 +570,24 @@ async def list_products():
 @app.get("/api/payments")
 async def list_payments(matched: str = "", limit: int = 50):
     """Список оплат."""
-    sb = get_supabase()
-    query = sb.table("payments").select("*")
+    filters = {}
     if matched == "true":
-        query = query.eq("is_matched", True)
+        filters["is_matched"] = True
     elif matched == "false":
-        query = query.eq("is_matched", False)
-    result = query.order("payment_date", desc=True).range(0, limit - 1).execute()
-    return result.data
+        filters["is_matched"] = False
+    return await db_select(
+        "payments",
+        filters=filters,
+        order="payment_date.desc",
+        limit=limit,
+    )
 
 
 @app.patch("/api/payments/{payment_id}")
 async def update_payment(payment_id: int, request: Request):
     """Сопоставить оплату с заказом."""
-    sb = get_supabase()
     body = await request.json()
-    result = sb.table("payments").update(body).eq("id", payment_id).execute()
-    return result.data
+    return await db_update("payments", body, {"id": payment_id})
 
 
 # ═══════════════════════════════════════
@@ -474,17 +596,13 @@ async def update_payment(payment_id: int, request: Request):
 
 @app.get("/api/quick-replies")
 async def list_quick_replies():
-    sb = get_supabase()
-    result = sb.table("quick_replies").select("*").order("usage_count", desc=True).execute()
-    return result.data
+    return await db_select("quick_replies", order="usage_count.desc")
 
 
 @app.post("/api/quick-replies")
 async def create_quick_reply(request: Request):
-    sb = get_supabase()
     body = await request.json()
-    result = sb.table("quick_replies").insert(body).execute()
-    return result.data
+    return await db_insert("quick_replies", body)
 
 
 # ═══════════════════════════════════════
@@ -493,20 +611,17 @@ async def create_quick_reply(request: Request):
 
 @app.get("/api/settings")
 async def get_settings():
-    sb = get_supabase()
-    result = sb.table("bot_settings").select("*").execute()
-    return {row["key"]: row["value"] for row in result.data}
+    data = await db_select("bot_settings")
+    return {row["key"]: row["value"] for row in data}
 
 
 @app.patch("/api/settings/{key}")
 async def update_setting(key: str, request: Request):
-    sb = get_supabase()
     body = await request.json()
-    result = sb.table("bot_settings").update({
+    return await db_update("bot_settings", {
         "value": body,
         "updated_at": datetime.utcnow().isoformat(),
-    }).eq("key", key).execute()
-    return result.data
+    }, {"key": key})
 
 
 # ═══════════════════════════════════════
@@ -515,29 +630,28 @@ async def update_setting(key: str, request: Request):
 
 @app.get("/api/clients")
 async def list_clients(search: str = "", limit: int = 50):
-    sb = get_supabase()
-    query = sb.table("clients").select("*")
+    or_filter = ""
     if search:
-        query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
-    result = query.order("created", desc=True).range(0, limit - 1).execute()
-    return result.data
+        or_filter = f"name.ilike.%{search}%,phone.ilike.%{search}%"
+    return await db_select(
+        "clients",
+        or_filter=or_filter,
+        order="created.desc",
+        limit=limit,
+    )
 
 
 @app.post("/api/clients")
 async def create_client(request: Request):
-    sb = get_supabase()
     body = await request.json()
-    result = sb.table("clients").insert(body).execute()
-    return result.data
+    return await db_insert("clients", body)
 
 
 @app.patch("/api/clients/{client_id}")
 async def update_client(client_id: int, request: Request):
-    sb = get_supabase()
     body = await request.json()
     body["updated_at"] = datetime.utcnow().isoformat()
-    result = sb.table("clients").update(body).eq("id", client_id).execute()
-    return result.data
+    return await db_update("clients", body, {"id": client_id})
 
 
 # ═══════════════════════════════════════
@@ -546,23 +660,16 @@ async def update_client(client_id: int, request: Request):
 
 @app.get("/api/stats")
 async def get_stats():
-    sb = get_supabase()
-    convs = sb.table("conversations").select("id", count="exact").eq(
-        "status", "active"
-    ).execute()
-    unread = sb.table("conversations").select("id", count="exact").gt(
-        "unread_count", 0
-    ).execute()
-    orders_new = sb.table("orders").select("id", count="exact").eq(
-        "status", "new"
-    ).execute()
-    orders_total = sb.table("orders").select("id", count="exact").execute()
-    products = sb.table("products").select("id", count="exact").execute()
+    convs = await db_select("conversations", columns="id", filters={"status": "active"}, count=True)
+    unread = await db_select("conversations", columns="id", gt={"unread_count": 0}, count=True)
+    orders_new = await db_select("orders", columns="id", filters={"status": "new"}, count=True)
+    orders_total = await db_select("orders", columns="id", count=True)
+    products = await db_select("products", columns="id", count=True)
 
     return {
-        "active_conversations": convs.count or 0,
-        "unread_conversations": unread.count or 0,
-        "new_orders": orders_new.count or 0,
-        "total_orders": orders_total.count or 0,
-        "total_products": products.count or 0,
+        "active_conversations": convs["count"],
+        "unread_conversations": unread["count"],
+        "new_orders": orders_new["count"],
+        "total_orders": orders_total["count"],
+        "total_products": products["count"],
     }
