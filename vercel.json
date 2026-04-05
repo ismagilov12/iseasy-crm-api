@@ -1,5 +1,6 @@
 {
-      "rewrites": [
-                { "source": "/:path((?!api/debug).*)", "destination": "/api/index" }
-      ]
+          "routes": [
+                        { "src": "/api/debug(.*)", "dest": "/api/debug.py" },
+                        { "src": "/(.*)", "dest": "/api/index.py" }
+          ]
 }
