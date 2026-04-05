@@ -703,9 +703,9 @@ h2{font-size:17px;margin:24px 0 8px;color:#333}p{margin-bottom:12px;font-size:15
 <h2>3. Зберігання даних</h2>
 <p>Дані зберігаються на захищених серверах (Supabase, ЄС). Ми не передаємо дані третім особам, окрім випадків, передбачених законом.</p>
 <h2>4. Видалення даних</h2>
-<p>Ви можете запросити видалення своїх даних, надіславши запит на email: <strong>ismagilov.yura@gmail.com</strong> або через <a href="/data-deletion">сторінку видалення даних</a>. Ми видалимо ваші дані протягом 30 днів.</p>
+<p>Ви можете запросити видалення своїх даних, надіславши запит на email: <strong>ulteracompany@gmail.com</strong> або через <a href="/data-deletion">сторінку видалення даних</a>. Ми видалимо ваші дані протягом 30 днів.</p>
 <h2>5. Контакти</h2>
-<p>Email: ismagilov.yura@gmail.com<br>Бренд: IS EASY (Україна)</p>
+<p>Email: ulteracompany@gmail.com<br>Бренд: IS EASY (Україна)</p>
 </div></body></html>"""
 
 
@@ -725,7 +725,7 @@ p{margin-bottom:12px;font-size:15px;color:#444}ol{margin:12px 0 12px 24px;font-s
 <div class="box">
 <h2 style="font-size:16px;margin-bottom:12px">Як запросити видалення:</h2>
 <ol>
-<li>Надішліть email на <strong>ismagilov.yura@gmail.com</strong> з темою "Видалення даних"</li>
+<li>Надішліть email на <strong>ulteracompany@gmail.com</strong> з темою "Видалення даних"</li>
 <li>Вкажіть ваш Instagram username або Facebook ID</li>
 <li>Ми видалимо всі ваші дані протягом 30 днів та повідомимо вас</li>
 </ol>
