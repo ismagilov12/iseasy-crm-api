@@ -9,7 +9,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-@app.get("/")
+@app.get("/api/debug")
 async def debug():
     info = {
         "supabase_url_set": bool(SUPABASE_URL),
@@ -18,7 +18,7 @@ async def debug():
         "supabase_key_len": len(SUPABASE_KEY),
     }
     try:
-        from supabase import create_client, Client
+        from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
         result = sb.table("products").select("id, name").limit(2).execute()
         info["supabase_ok"] = True
