@@ -197,26 +197,33 @@ async def webhook_verify(
 
 @app.post("/webhook")
 async def webhook_receive(request: Request):
-    """Приём сообщений из Instagram Direct (POST)."""
+    """Приём сообщений из Instagram Direct + комментариев (POST)."""
     body = await request.body()
 
+    # Signature verification (skip if META_APP_SECRET not set)
     if META_APP_SECRET:
         signature = request.headers.get("X-Hub-Signature-256", "")
-        expected = "sha256=" + hmac.new(
-            META_APP_SECRET.encode(), body, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(signature, expected):
-            raise HTTPException(status_code=403, detail="Invalid signature")
+        if signature:
+            expected = "sha256=" + hmac.new(
+                META_APP_SECRET.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = json.loads(body)
 
     for entry in data.get("entry", []):
+        # Direct Messages
         for messaging in entry.get("messaging", []):
             sender_id = messaging.get("sender", {}).get("id", "")
             message = messaging.get("message", {})
-
             if message and sender_id != META_PAGE_ID:
                 await process_incoming_message(sender_id, message)
+
+        # Comments on posts
+        for change in entry.get("changes", []):
+            if change.get("field") == "comments":
+                await process_incoming_comment(change.get("value", {}))
 
     return {"status": "ok"}
 
@@ -674,6 +681,99 @@ async def get_stats():
         "total_orders": orders_total["count"],
         "total_products": products["count"],
     }
+
+
+# ═══════════════════════════════════════
+#  INSTAGRAM COMMENTS
+# ═══════════════════════════════════════
+
+async def process_incoming_comment(value: dict):
+    """Process incoming Instagram comment from webhook."""
+    try:
+        comment_id = value.get("id", "")
+        media_id = value.get("media", {}).get("id", "") if isinstance(value.get("media"), dict) else value.get("media_id", "")
+        from_user = value.get("from", {})
+        user_id = from_user.get("id", "")
+        username = from_user.get("username", "")
+        text = value.get("text", "")
+        parent_id = value.get("parent_id", "")
+        timestamp = value.get("created_time", datetime.utcnow().isoformat())
+
+        await db_insert("instagram_comments", {
+            "instagram_comment_id": comment_id,
+            "instagram_media_id": media_id,
+            "instagram_user_id": user_id,
+            "username": username,
+            "text": text,
+            "parent_comment_id": parent_id if parent_id else None,
+            "is_reply": bool(parent_id),
+            "timestamp": timestamp,
+        })
+    except Exception as e:
+        print(f"Error processing comment: {e}")
+
+
+async def reply_to_comment(comment_id: str, reply_text: str):
+    """Reply to an Instagram comment via Graph API."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://graph.instagram.com/v21.0/{comment_id}/replies",
+            params={"message": reply_text, "access_token": META_ACCESS_TOKEN},
+        )
+        return resp.json()
+
+
+@app.get("/api/comments")
+async def list_comments():
+    rows = await db_select("instagram_comments", order="created_at.desc", limit=100)
+    return rows.get("data", []) if isinstance(rows, dict) else rows
+
+
+@app.get("/api/comments/by-media/{media_id}")
+async def comments_by_media(media_id: str):
+    rows = await db_select("instagram_comments", filters={"instagram_media_id": media_id}, order="created_at.desc")
+    return rows.get("data", []) if isinstance(rows, dict) else rows
+
+
+@app.post("/api/comments/{comment_id}/reply")
+async def reply_comment(comment_id: str, request: Request):
+    body = await request.json()
+    text = body.get("text", "")
+    if not text:
+        raise HTTPException(400, "text is required")
+
+    result = await reply_to_comment(comment_id, text)
+
+    reply_id = result.get("id", "")
+    if reply_id:
+        await db_insert("instagram_comments", {
+            "instagram_comment_id": reply_id,
+            "instagram_media_id": "",
+            "instagram_user_id": INSTAGRAM_BUSINESS_ID,
+            "username": "ультра_взуття",
+            "text": text,
+            "parent_comment_id": comment_id,
+            "is_reply": True,
+            "reply_comment_id": comment_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+    return {"status": "ok", "reply_id": reply_id, "api_response": result}
+
+
+@app.delete("/api/comments/{comment_id}")
+async def delete_comment(comment_id: int):
+    return await db_delete("instagram_comments", {"id": comment_id})
+
+
+async def db_delete(table: str, filters: dict) -> dict:
+    """DELETE from Supabase table."""
+    params = {f"{k}": f"eq.{v}" for k, v in filters.items()}
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{REST_URL}/{table}", headers=_h(Prefer="return=representation"), params=params
+        )
+        return resp.json() if resp.status_code < 300 else {"error": resp.text}
 
 
 # ═══════════════════════════════════════
