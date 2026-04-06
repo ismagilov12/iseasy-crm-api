@@ -1616,3 +1616,45 @@ async def unmatched_payments():
         order="payment_date.desc",
         limit=50,
     )
+
+
+# ── Suggest matching payments for a client by name ──
+
+@app.get("/api/payments/suggest")
+async def suggest_payments(client_name: str = "", conversation_id: int = 0):
+    """
+    Get all unmatched payments, sorted by relevance to client_name.
+    Returns: [{...payment, match_score: 0..1}]
+    Best matches (by surname fuzzy) go first.
+    """
+    all_unmatched = await db_select(
+        "payments",
+        filters={"is_matched": False},
+        order="payment_date.desc",
+        limit=100,
+    )
+    if not all_unmatched or not isinstance(all_unmatched, list):
+        return []
+
+    scored = []
+    for p in all_unmatched:
+        payer = p.get("payer_name", "")
+        score = _fuzzy_match(client_name, payer) if client_name else 0
+        scored.append({**p, "match_score": round(score, 2)})
+
+    # Sort: best matches first, then by date
+    scored.sort(key=lambda x: (-x["match_score"], x.get("payment_date", "")))
+    return scored
+
+
+# ── Get matched payments for a conversation ──
+
+@app.get("/api/payments/by-conversation/{conversation_id}")
+async def payments_by_conversation(conversation_id: int):
+    """Get all payments matched to a specific conversation."""
+    return await db_select(
+        "payments",
+        filters={"matched_conversation_id": conversation_id},
+        order="payment_date.desc",
+        limit=50,
+    )
