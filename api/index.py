@@ -1976,9 +1976,133 @@ async def monobank_sync_statements(request: Request):
         except Exception as e:
             errors.append(f"Account {account_id[-4:]}: {str(e)}")
 
+    # Also sync WayForPay if configured
+    wfp_synced, wfp_errors = await _sync_wayforpay(days)
+    total_synced += wfp_synced
+
     return {
         "status": "ok",
         "synced": total_synced,
         "skipped": total_skipped,
-        "errors": errors,
+        "errors": errors + wfp_errors,
     }
+
+
+async def _sync_wayforpay(days: int = 3):
+    """Fetch WayForPay transaction list for the last N days."""
+    wfp_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "wayforpay"}, maybe_single=True,
+    )
+    if not wfp_settings:
+        return 0, []
+
+    val = wfp_settings.get("value", {}) if isinstance(wfp_settings, dict) else {}
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except Exception:
+            val = {}
+
+    merchant_account = val.get("merchant_account", "")
+    merchant_secret = val.get("merchant_secret", "")
+    if not merchant_account or not merchant_secret:
+        return 0, ["WFP: merchant_account or merchant_secret not configured"]
+
+    now = int(datetime.utcnow().timestamp())
+    date_begin = now - (days * 86400)
+
+    # WFP API: transactionList
+    # Signature = HMAC_MD5(merchantSecret, merchantAccount;dateBegin;dateEnd)
+    sign_string = f"{merchant_account};{date_begin};{now}"
+    signature = hmac.new(
+        merchant_secret.encode("utf-8"),
+        sign_string.encode("utf-8"),
+        hashlib.md5,
+    ).hexdigest()
+
+    request_body = {
+        "transactionType": "TRANSACTION_LIST",
+        "merchantAccount": merchant_account,
+        "merchantSignature": signature,
+        "dateBegin": date_begin,
+        "dateEnd": now,
+    }
+
+    synced = 0
+    errors = []
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.wayforpay.com/api",
+                json=request_body,
+            )
+
+        if resp.status_code != 200:
+            return 0, [f"WFP: HTTP {resp.status_code}"]
+
+        data = resp.json()
+        reason_code = data.get("reasonCode")
+        if reason_code and reason_code != 1100:
+            reason = data.get("reason", "unknown")
+            return 0, [f"WFP: {reason} (code {reason_code})"]
+
+        transactions = data.get("transactionList", [])
+        if not isinstance(transactions, list):
+            return 0, []
+
+        for tx in transactions:
+            tx_status = tx.get("transactionStatus", "")
+            if tx_status != "Approved":
+                continue
+
+            order_ref = tx.get("orderReference", "")
+            amount = float(tx.get("amount", 0))
+            payer_name = tx.get("clientName", "") or tx.get("client_name", "")
+            currency = tx.get("currency", "UAH")
+
+            # Check if already exists
+            existing = await db_select(
+                "payments", columns="id",
+                filters={"external_id": order_ref}, maybe_single=True,
+            )
+            if existing and (isinstance(existing, dict) and existing.get("id")):
+                continue
+
+            # Payment date
+            created = tx.get("createdDate", "") or tx.get("processingDate", "")
+            if created and isinstance(created, (int, float)):
+                payment_dt = datetime.utcfromtimestamp(created).isoformat()
+            elif created and isinstance(created, str) and created.isdigit():
+                payment_dt = datetime.utcfromtimestamp(int(created)).isoformat()
+            else:
+                payment_dt = datetime.utcnow().isoformat()
+
+            payment_data = {
+                "source": "wayforpay",
+                "external_id": order_ref,
+                "payer_name": payer_name,
+                "amount": amount,
+                "currency": currency,
+                "status": "success",
+                "raw_data": json.dumps(tx),
+                "payment_date": payment_dt,
+            }
+            try:
+                result = await db_insert("payments", payment_data)
+                synced += 1
+                pid = None
+                if isinstance(result, list) and result:
+                    pid = result[0].get("id")
+                elif isinstance(result, dict):
+                    pid = result.get("id")
+                if pid and payer_name:
+                    await _auto_match_payment(pid, payer_name, amount)
+            except Exception as e:
+                print(f"[WFP SYNC] Insert error: {e}")
+
+    except Exception as e:
+        errors.append(f"WFP: {str(e)}")
+
+    return synced, errors
