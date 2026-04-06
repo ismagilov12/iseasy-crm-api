@@ -580,7 +580,7 @@ async def list_messages(conv_id: int, limit: int = 100, offset: int = 0):
 
 @app.post("/api/conversations/{conv_id}/messages")
 async def send_message(conv_id: int, request: Request):
-    """Отправить сообщение клиенту."""
+    """Отправить сообщение клиенту (Instagram или Telegram)."""
     body = await request.json()
     text = body.get("text", "")
     image_url = body.get("image_url", "")
@@ -590,20 +590,43 @@ async def send_message(conv_id: int, request: Request):
         raise HTTPException(status_code=400, detail="Message text or image_url is required")
 
     conv = await db_select("conversations", filters={"id": conv_id}, single=True)
+    platform = conv.get("platform", "instagram")
 
-    # Build quick_replies for Instagram format
-    quick_replies = None
-    if quick_replies_raw:
-        quick_replies = [
-            {"content_type": "text", "title": qr.get("title", qr) if isinstance(qr, dict) else str(qr), "payload": qr.get("payload", qr) if isinstance(qr, dict) else str(qr)}
-            for qr in quick_replies_raw
-        ]
+    if platform == "telegram" and conv.get("telegram_user_id"):
+        # ── Telegram: put message in outbox, worker will send it ──
+        outbox_entry = {
+            "telegram_user_id": conv["telegram_user_id"],
+            "conversation_id": conv_id,
+            "text": text,
+            "media_url": image_url or "",
+            "status": "pending",
+        }
+        await db_insert("telegram_outbox", outbox_entry)
 
-    result = await send_instagram_message(
-        conv["instagram_user_id"], text, conv_id,
-        image_url=image_url if image_url else None,
-        quick_replies=quick_replies,
-    )
+        # Save message locally so it appears in CRM immediately
+        await db_insert("messages", {
+            "conversation_id": conv_id,
+            "direction": "outgoing",
+            "message_type": "image" if image_url else "text",
+            "content": text,
+            "media_url": image_url or "",
+        })
+
+        result = {"status": "queued_telegram"}
+    else:
+        # ── Instagram: send directly via Graph API ──
+        quick_replies = None
+        if quick_replies_raw:
+            quick_replies = [
+                {"content_type": "text", "title": qr.get("title", qr) if isinstance(qr, dict) else str(qr), "payload": qr.get("payload", qr) if isinstance(qr, dict) else str(qr)}
+                for qr in quick_replies_raw
+            ]
+
+        result = await send_instagram_message(
+            conv["instagram_user_id"], text, conv_id,
+            image_url=image_url if image_url else None,
+            quick_replies=quick_replies,
+        )
 
     await db_update("conversations", {
         "last_message_text": (text or "[Фото]")[:200],
@@ -1166,3 +1189,430 @@ async def data_deletion_callback(request: Request):
         }
     except Exception:
         return {"url": "https://iseasy-crm-api.vercel.app/data-deletion", "confirmation_code": "iseasy_error"}
+
+
+# ═══════════════════════════════════════
+#  PAYMENT WEBHOOKS — WayForPay & Monobank
+# ═══════════════════════════════════════
+
+import re
+from difflib import SequenceMatcher
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize Ukrainian/Russian name for fuzzy matching."""
+    if not name:
+        return ""
+    return re.sub(r"[^а-яіїєґa-z\s]", "", name.lower().strip())
+
+
+def _fuzzy_match(a: str, b: str) -> float:
+    """Compare two strings with SequenceMatcher, return similarity 0..1."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
+
+
+async def _auto_match_payment(payment_id: int, payer_name: str, amount: float):
+    """
+    Try to auto-match a payment to an order by payer surname.
+    Logic:
+      1. Get all orders with status in ('new','processing','payment') where paid < total
+      2. For each order, get the client (via client_id or conversation.client_data)
+      3. Fuzzy-match payer_name vs client surname
+      4. If match >= 0.7, link payment to order
+    """
+    try:
+        # Get unmatched orders (not fully paid)
+        orders = await db_select(
+            "orders",
+            columns="id,conversation_id,client_id,client,total,paid,status",
+            or_filter="status.eq.new,status.eq.processing,status.eq.payment",
+            order="created_at.desc",
+            limit=100,
+        )
+        if not orders or (isinstance(orders, dict) and "error" in orders):
+            return None
+
+        best_match = None
+        best_score = 0.0
+
+        for order in orders:
+            order_paid = float(order.get("paid") or 0)
+            order_total = float(order.get("total") or 0)
+            if order_paid >= order_total:
+                continue
+
+            # Try to get client name from the order's client field or client_id
+            client_name = order.get("client", "")
+
+            # If no name on order, try conversation's client_data
+            if not client_name and order.get("conversation_id"):
+                conv = await db_select(
+                    "conversations",
+                    columns="client_data,client_name",
+                    filters={"id": order["conversation_id"]},
+                    maybe_single=True,
+                )
+                if conv:
+                    cd = conv.get("client_data")
+                    if isinstance(cd, str):
+                        try:
+                            cd = json.loads(cd)
+                        except Exception:
+                            cd = {}
+                    if isinstance(cd, dict):
+                        client_name = cd.get("surname", "") + " " + cd.get("name", "")
+                    if not client_name.strip():
+                        client_name = conv.get("client_name", "")
+
+            # If still no name, try clients table
+            if not client_name.strip() and order.get("client_id"):
+                cl = await db_select(
+                    "clients",
+                    columns="surname,name",
+                    filters={"id": order["client_id"]},
+                    maybe_single=True,
+                )
+                if cl:
+                    client_name = (cl.get("surname", "") + " " + cl.get("name", "")).strip()
+
+            if not client_name.strip():
+                continue
+
+            score = _fuzzy_match(payer_name, client_name)
+            if score > best_score:
+                best_score = score
+                best_match = order
+
+        # Match threshold
+        if best_match and best_score >= 0.65:
+            new_paid = float(best_match.get("paid") or 0) + amount
+            order_total = float(best_match.get("total") or 0)
+            new_status = "confirmed" if new_paid >= order_total else best_match.get("status", "payment")
+
+            # Update payment
+            await db_update("payments", {
+                "matched_order_id": best_match["id"],
+                "matched_conversation_id": best_match.get("conversation_id"),
+                "is_matched": True,
+            }, {"id": payment_id})
+
+            # Update order paid amount
+            await db_update("orders", {
+                "paid": new_paid,
+                "status": new_status,
+                "updated_at": datetime.utcnow().isoformat(),
+            }, {"id": best_match["id"]})
+
+            return {
+                "matched": True,
+                "order_id": best_match["id"],
+                "score": round(best_score, 2),
+                "new_paid": new_paid,
+                "fully_paid": new_paid >= order_total,
+            }
+
+        return {"matched": False, "best_score": round(best_score, 2) if best_score > 0 else 0}
+
+    except Exception as e:
+        print(f"Auto-match error: {e}")
+        traceback.print_exc()
+        return {"matched": False, "error": str(e)}
+
+
+# ── WayForPay Webhook ──
+
+@app.post("/webhook/wayforpay")
+async def wayforpay_webhook(request: Request):
+    """
+    WayForPay sends POST with JSON:
+    {
+      "merchantAccount": "...",
+      "orderReference": "...",
+      "amount": 1400,
+      "currency": "UAH",
+      "authCode": "...",
+      "transactionStatus": "Approved",
+      "reasonCode": 1100,
+      "clientName": "Бондар Олена",
+      "email": "...",
+      "phone": "...",
+      ...
+    }
+    We must respond with:
+    {
+      "orderReference": "...",
+      "status": "accept",
+      "time": <unix_timestamp>,
+      "signature": "<hmac_md5>"
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    tx_status = body.get("transactionStatus", "")
+    order_ref = body.get("orderReference", "")
+    amount_raw = body.get("amount", 0)
+    amount = float(amount_raw) if amount_raw else 0
+    payer_name = body.get("clientName", "") or body.get("client_name", "")
+    currency = body.get("currency", "UAH")
+    auth_code = body.get("authCode", "")
+
+    print(f"[WFP] Webhook received: status={tx_status}, ref={order_ref}, amount={amount}, payer={payer_name}")
+
+    # Only process successful payments
+    pay_status = "success" if tx_status == "Approved" else tx_status.lower()
+
+    # Save payment to DB
+    payment_data = {
+        "source": "wayforpay",
+        "external_id": order_ref,
+        "payer_name": payer_name,
+        "amount": amount,
+        "currency": currency,
+        "status": pay_status,
+        "raw_data": json.dumps(body),
+        "payment_date": datetime.utcnow().isoformat(),
+    }
+    result = await db_insert("payments", payment_data)
+    payment_id = None
+    if isinstance(result, list) and result:
+        payment_id = result[0].get("id")
+    elif isinstance(result, dict):
+        payment_id = result.get("id")
+
+    # Auto-match if successful
+    match_result = None
+    if pay_status == "success" and payment_id and payer_name:
+        match_result = await _auto_match_payment(payment_id, payer_name, amount)
+
+    # Build WFP response with signature
+    # signature = HMAC_MD5(merchantSecretKey, merchantAccount;orderReference;time;status)
+    now_ts = int(datetime.utcnow().timestamp())
+    response_status = "accept"
+
+    # Try to get merchant secret from settings
+    wfp_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "wayforpay"}, maybe_single=True,
+    )
+    merchant_secret = ""
+    if wfp_settings and isinstance(wfp_settings, dict):
+        val = wfp_settings.get("value", {})
+        if isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except Exception:
+                val = {}
+        merchant_secret = val.get("merchant_secret", "")
+
+    merchant_account = body.get("merchantAccount", "")
+    sign_string = f"{merchant_account};{order_ref};{now_ts};{response_status}"
+    signature = ""
+    if merchant_secret:
+        signature = hmac.new(
+            merchant_secret.encode("utf-8"),
+            sign_string.encode("utf-8"),
+            hashlib.md5,
+        ).hexdigest()
+
+    return {
+        "orderReference": order_ref,
+        "status": response_status,
+        "time": now_ts,
+        "signature": signature,
+    }
+
+
+# ── Monobank Webhook ──
+
+@app.post("/webhook/monobank")
+async def monobank_webhook(request: Request):
+    """
+    Monobank sends POST with JSON:
+    {
+      "type": "StatementItem",
+      "data": {
+        "account": "...",
+        "statementItem": {
+          "id": "...",
+          "time": 1712345678,
+          "description": "Від: Бондар Олена",
+          "mcc": 4829,
+          "originalMcc": 4829,
+          "amount": 140000,      # in kopecks!
+          "operationAmount": 140000,
+          "currencyCode": 980,
+          "commissionRate": 0,
+          "cashbackAmount": 0,
+          "balance": ...,
+          "comment": "...",
+          "counterEdrpou": "...",
+          "counterIban": "...",
+          "counterName": "БОНДАР ОЛЕНА"
+        }
+      }
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    data = body.get("data", {})
+    statement = data.get("statementItem", {})
+
+    mono_id = statement.get("id", "")
+    amount_kopecks = statement.get("amount", 0)
+    amount = abs(amount_kopecks) / 100  # Convert from kopecks to UAH
+    description = statement.get("description", "")
+    counter_name = statement.get("counterName", "")
+    comment = statement.get("comment", "")
+    tx_time = statement.get("time", 0)
+
+    # Extract payer name: prefer counterName, fallback to description parsing
+    payer_name = counter_name
+    if not payer_name and description:
+        # Try to extract from "Від: Прізвище Ім'я" pattern
+        match = re.search(r"(?:Від|від|From|from)[:\s]+(.+)", description)
+        if match:
+            payer_name = match.group(1).strip()
+        else:
+            payer_name = description
+
+    # Only process incoming payments (positive amount)
+    if amount_kopecks <= 0:
+        return {"status": "ok", "skipped": "outgoing transaction"}
+
+    print(f"[MONO] Webhook received: id={mono_id}, amount={amount}, payer={payer_name}")
+
+    payment_date = datetime.utcfromtimestamp(tx_time).isoformat() if tx_time else datetime.utcnow().isoformat()
+
+    payment_data = {
+        "source": "monobank",
+        "external_id": mono_id,
+        "payer_name": payer_name,
+        "amount": amount,
+        "currency": "UAH",
+        "status": "success",
+        "raw_data": json.dumps(body),
+        "payment_date": payment_date,
+    }
+    result = await db_insert("payments", payment_data)
+    payment_id = None
+    if isinstance(result, list) and result:
+        payment_id = result[0].get("id")
+    elif isinstance(result, dict):
+        payment_id = result.get("id")
+
+    # Auto-match
+    match_result = None
+    if payment_id and payer_name:
+        match_result = await _auto_match_payment(payment_id, payer_name, amount)
+
+    return {"status": "ok", "payment_id": payment_id, "match": match_result}
+
+
+# ── Monobank: Setup Webhook via their API ──
+
+@app.post("/api/monobank/setup-webhook")
+async def setup_monobank_webhook(request: Request):
+    """Register our webhook URL with Monobank personal API."""
+    body = await request.json()
+    token = body.get("token", "")
+    webhook_url = body.get("webhook_url", "https://iseasy-crm-api.vercel.app/webhook/monobank")
+
+    if not token:
+        raise HTTPException(400, "Monobank API token is required")
+
+    async with httpx.AsyncClient() as client:
+        # Set webhook
+        resp = await client.post(
+            "https://api.monobank.ua/personal/webhook",
+            json={"webHookUrl": webhook_url},
+            headers={"X-Token": token},
+        )
+
+        if resp.status_code == 200:
+            # Verify by getting client info
+            info_resp = await client.get(
+                "https://api.monobank.ua/personal/client-info",
+                headers={"X-Token": token},
+            )
+            info = info_resp.json() if info_resp.status_code == 200 else {}
+            client_name = info.get("name", "")
+            accounts = info.get("accounts", [])
+            # Find UAH account (currencyCode 980)
+            uah_accounts = [a for a in accounts if a.get("currencyCode") == 980]
+
+            return {
+                "status": "ok",
+                "client_name": client_name,
+                "accounts": len(uah_accounts),
+                "webhook_set": True,
+            }
+        else:
+            error_text = resp.text
+            return {
+                "status": "error",
+                "code": resp.status_code,
+                "error": error_text,
+            }
+
+
+# ── Manual payment matching ──
+
+@app.post("/api/payments/{payment_id}/match")
+async def manual_match_payment(payment_id: int, request: Request):
+    """Manually match a payment to an order."""
+    body = await request.json()
+    order_id = body.get("order_id")
+    if not order_id:
+        raise HTTPException(400, "order_id is required")
+
+    # Get payment
+    payment = await db_select("payments", filters={"id": payment_id}, single=True)
+    amount = float(payment.get("amount", 0))
+
+    # Get order
+    order = await db_select("orders", filters={"id": order_id}, single=True)
+    new_paid = float(order.get("paid", 0)) + amount
+    order_total = float(order.get("total", 0))
+    new_status = "confirmed" if new_paid >= order_total else order.get("status", "payment")
+
+    # Update payment
+    await db_update("payments", {
+        "matched_order_id": order_id,
+        "matched_conversation_id": order.get("conversation_id"),
+        "is_matched": True,
+    }, {"id": payment_id})
+
+    # Update order
+    await db_update("orders", {
+        "paid": new_paid,
+        "status": new_status,
+        "updated_at": datetime.utcnow().isoformat(),
+    }, {"id": order_id})
+
+    return {
+        "status": "ok",
+        "order_id": order_id,
+        "new_paid": new_paid,
+        "fully_paid": new_paid >= order_total,
+    }
+
+
+# ── Get unmatched payments ──
+
+@app.get("/api/payments/unmatched")
+async def unmatched_payments():
+    """Get payments that haven't been matched to an order yet."""
+    return await db_select(
+        "payments",
+        filters={"is_matched": False},
+        order="payment_date.desc",
+        limit=50,
+    )
