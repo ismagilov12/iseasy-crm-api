@@ -1718,6 +1718,7 @@ async def manual_match_payment(payment_id: int, request: Request):
 
         return {
             "status": "ok",
+            "payment_id": payment_id,
             "order_id": order_id,
             "new_paid": new_paid,
             "fully_paid": new_paid >= order_total,
@@ -1731,11 +1732,40 @@ async def manual_match_payment(payment_id: int, request: Request):
 
         return {
             "status": "ok",
+            "payment_id": payment_id,
             "conversation_id": conversation_id,
             "amount": amount,
         }
     else:
         raise HTTPException(400, "order_id or conversation_id is required")
+
+
+@app.post("/api/payments/{payment_id}/unmatch")
+async def unmatch_payment(payment_id: int):
+    """Remove payment matching — make it available again for linking."""
+    payment = await db_select("payments", filters={"id": payment_id}, single=True)
+    old_order_id = payment.get("matched_order_id")
+    amount = float(payment.get("amount", 0))
+
+    # Unset matching fields
+    await db_update("payments", {
+        "matched_order_id": None,
+        "matched_conversation_id": None,
+        "is_matched": False,
+    }, {"id": payment_id})
+
+    # If was matched to order, subtract amount from paid
+    if old_order_id:
+        order = await db_select("orders", filters={"id": old_order_id}, single=True)
+        new_paid = max(0, float(order.get("paid", 0)) - amount)
+        await db_update("orders", {
+            "paid": new_paid,
+            "status": "payment" if new_paid < float(order.get("total", 0)) else order.get("status"),
+            "updated_at": datetime.utcnow().isoformat(),
+        }, {"id": old_order_id})
+        return {"status": "ok", "payment_id": payment_id, "order_id": old_order_id, "new_paid": new_paid}
+
+    return {"status": "ok", "payment_id": payment_id}
 
 
 # ── Get unmatched payments ──
