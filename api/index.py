@@ -9,7 +9,7 @@ import json
 import hmac
 import hashlib
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -1665,42 +1665,55 @@ async def get_monobank_accounts(request: Request):
 
 @app.post("/api/payments/{payment_id}/match")
 async def manual_match_payment(payment_id: int, request: Request):
-    """Manually match a payment to an order."""
+    """Manually match a payment to an order or just to a conversation."""
     body = await request.json()
     order_id = body.get("order_id")
-    if not order_id:
-        raise HTTPException(400, "order_id is required")
+    conversation_id = body.get("conversation_id")
 
     # Get payment
     payment = await db_select("payments", filters={"id": payment_id}, single=True)
     amount = float(payment.get("amount", 0))
 
-    # Get order
-    order = await db_select("orders", filters={"id": order_id}, single=True)
-    new_paid = float(order.get("paid", 0)) + amount
-    order_total = float(order.get("total", 0))
-    new_status = "confirmed" if new_paid >= order_total else order.get("status", "payment")
+    if order_id:
+        # Match to specific order
+        order = await db_select("orders", filters={"id": order_id}, single=True)
+        new_paid = float(order.get("paid", 0)) + amount
+        order_total = float(order.get("total", 0))
+        new_status = "confirmed" if new_paid >= order_total else order.get("status", "payment")
+        conv_id = order.get("conversation_id") or conversation_id
 
-    # Update payment
-    await db_update("payments", {
-        "matched_order_id": order_id,
-        "matched_conversation_id": order.get("conversation_id"),
-        "is_matched": True,
-    }, {"id": payment_id})
+        await db_update("payments", {
+            "matched_order_id": order_id,
+            "matched_conversation_id": conv_id,
+            "is_matched": True,
+        }, {"id": payment_id})
 
-    # Update order
-    await db_update("orders", {
-        "paid": new_paid,
-        "status": new_status,
-        "updated_at": datetime.utcnow().isoformat(),
-    }, {"id": order_id})
+        await db_update("orders", {
+            "paid": new_paid,
+            "status": new_status,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, {"id": order_id})
 
-    return {
-        "status": "ok",
-        "order_id": order_id,
-        "new_paid": new_paid,
-        "fully_paid": new_paid >= order_total,
-    }
+        return {
+            "status": "ok",
+            "order_id": order_id,
+            "new_paid": new_paid,
+            "fully_paid": new_paid >= order_total,
+        }
+    elif conversation_id:
+        # Match to conversation only (no order yet)
+        await db_update("payments", {
+            "matched_conversation_id": conversation_id,
+            "is_matched": True,
+        }, {"id": payment_id})
+
+        return {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "amount": amount,
+        }
+    else:
+        raise HTTPException(400, "order_id or conversation_id is required")
 
 
 # ── Get unmatched payments ──
@@ -1719,28 +1732,32 @@ async def unmatched_payments():
 # ── Suggest matching payments for a client by name ──
 
 @app.get("/api/payments/suggest")
-async def suggest_payments(client_name: str = "", conversation_id: int = 0):
+async def suggest_payments(client_name: str = "", conversation_id: int = 0, days: int = 3):
     """
-    Get all unmatched payments, sorted by relevance to client_name.
-    Returns: [{...payment, match_score: 0..1}]
-    Best matches (by surname fuzzy) go first.
+    Get all payments for the last N days, sorted by relevance to client_name.
+    Returns both matched and unmatched payments.
     """
-    all_unmatched = await db_select(
-        "payments",
-        filters={"is_matched": False},
-        order="payment_date.desc",
-        limit=100,
-    )
-    if not all_unmatched or not isinstance(all_unmatched, list):
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    # Use raw REST query to filter by date
+    params = {
+        "payment_date": f"gte.{since}",
+        "order": "payment_date.desc",
+        "limit": "200",
+    }
+    hdrs = _h()
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{REST_URL}/payments", params=params, headers=hdrs)
+    all_payments = resp.json() if resp.status_code == 200 else []
+    if not isinstance(all_payments, list):
         return []
 
     scored = []
-    for p in all_unmatched:
+    for p in all_payments:
         payer = p.get("payer_name", "")
         score = _fuzzy_match(client_name, payer) if client_name else 0
         scored.append({**p, "match_score": round(score, 2)})
 
-    # Sort: best matches first, then by date
+    # Sort: best matches first, then by date desc
     scored.sort(key=lambda x: (-x["match_score"], x.get("payment_date", "")))
     return scored
 
