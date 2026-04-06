@@ -396,7 +396,8 @@ async def maybe_auto_reply(recipient_id: str, conversation_id: int):
 
 
 async def send_instagram_message(
-    recipient_id: str, text: str, conversation_id: Optional[int] = None
+    recipient_id: str, text: str, conversation_id: Optional[int] = None,
+    image_url: Optional[str] = None, quick_replies: Optional[list] = None,
 ):
     """Отправка сообщения в Instagram Direct через Graph API."""
     if not META_ACCESS_TOKEN:
@@ -405,36 +406,65 @@ async def send_instagram_message(
             await db_insert("messages", {
                 "conversation_id": conversation_id,
                 "direction": "outgoing",
-                "message_type": "text",
+                "message_type": "image" if image_url else "text",
                 "content": text,
+                "media_url": image_url or "",
             })
         return {"status": "saved_locally"}
 
-    # Use INSTAGRAM_BUSINESS_ID for Instagram Messaging API
     ig_id = INSTAGRAM_BUSINESS_ID or META_PAGE_ID
     url = f"https://graph.instagram.com/v21.0/{ig_id}/messages"
-    print(f"SEND: POST {url} to recipient={recipient_id}")
+    results = []
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            json={
-                "recipient": {"id": recipient_id},
-                "message": {"text": text},
-            },
-            headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
-        )
+        # Send image first if provided
+        if image_url:
+            print(f"SEND IMAGE: {image_url} to {recipient_id}")
+            img_resp = await client.post(
+                url,
+                json={
+                    "recipient": {"id": recipient_id},
+                    "message": {
+                        "attachment": {
+                            "type": "image",
+                            "payload": {"url": image_url}
+                        }
+                    },
+                },
+                headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+            )
+            img_result = img_resp.json()
+            print(f"SEND IMAGE RESULT: {img_resp.status_code} {img_result}")
+            results.append(img_result)
 
-    result = resp.json()
-    print(f"SEND RESULT: {resp.status_code} {result}")
+        # Send text message (with optional quick replies)
+        if text:
+            msg_payload = {"text": text}
+            if quick_replies:
+                msg_payload["quick_replies"] = quick_replies
+            print(f"SEND TEXT: to {recipient_id}")
+            txt_resp = await client.post(
+                url,
+                json={
+                    "recipient": {"id": recipient_id},
+                    "message": msg_payload,
+                },
+                headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"},
+            )
+            txt_result = txt_resp.json()
+            print(f"SEND TEXT RESULT: {txt_resp.status_code} {txt_result}")
+            results.append(txt_result)
+
+    result = results[-1] if results else {}
 
     if conversation_id:
         await db_insert("messages", {
             "conversation_id": conversation_id,
             "instagram_message_id": result.get("message_id", ""),
             "direction": "outgoing",
-            "message_type": "text",
+            "message_type": "image" if image_url else "text",
             "content": text,
+            "media_url": image_url or "",
         })
 
     return result
@@ -530,18 +560,30 @@ async def send_message(conv_id: int, request: Request):
     """Отправить сообщение клиенту."""
     body = await request.json()
     text = body.get("text", "")
+    image_url = body.get("image_url", "")
+    quick_replies_raw = body.get("quick_replies", [])
 
-    if not text:
-        raise HTTPException(status_code=400, detail="Message text is required")
+    if not text and not image_url:
+        raise HTTPException(status_code=400, detail="Message text or image_url is required")
 
     conv = await db_select("conversations", filters={"id": conv_id}, single=True)
 
+    # Build quick_replies for Instagram format
+    quick_replies = None
+    if quick_replies_raw:
+        quick_replies = [
+            {"content_type": "text", "title": qr.get("title", qr) if isinstance(qr, dict) else str(qr), "payload": qr.get("payload", qr) if isinstance(qr, dict) else str(qr)}
+            for qr in quick_replies_raw
+        ]
+
     result = await send_instagram_message(
-        conv["instagram_user_id"], text, conv_id
+        conv["instagram_user_id"], text, conv_id,
+        image_url=image_url if image_url else None,
+        quick_replies=quick_replies,
     )
 
     await db_update("conversations", {
-        "last_message_text": text[:200],
+        "last_message_text": (text or "[Фото]")[:200],
         "last_message_at": datetime.utcnow().isoformat(),
         "last_message_dir": "out",
         "updated_at": datetime.utcnow().isoformat(),
