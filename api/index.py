@@ -724,6 +724,81 @@ async def list_products():
     )
 
 
+@app.post("/api/products")
+async def create_product(request: Request):
+    """Create one product or upsert a list of products."""
+    body = await request.json()
+
+    # Accept single product or list
+    items = body if isinstance(body, list) else [body]
+    results = []
+
+    for item in items:
+        row = {
+            "name": item.get("name", ""),
+            "sku": item.get("sku", ""),
+            "category": item.get("category", ""),
+            "price": item.get("price", 0),
+            "cost": item.get("cost", 0),
+            "stock": item.get("stock", 0),
+            "sizes": json.dumps(item.get("sizes", [])),
+            "gender": item.get("gender", "m"),
+            "image_url": item.get("img", "") or item.get("image_url", ""),
+            "photo": item.get("img", "") or item.get("photo", ""),
+            "is_active": True,
+        }
+
+        # If product has a numeric id and exists in DB — update it
+        prod_id = item.get("id")
+        if prod_id and isinstance(prod_id, int) and prod_id < 1e12:
+            # Check if exists
+            existing = await db_select("products", filters={"id": prod_id}, maybe_single=True)
+            if existing:
+                updated = await db_update("products", row, {"id": prod_id})
+                results.append(updated[0] if isinstance(updated, list) and updated else updated)
+                continue
+
+        # Insert new product
+        result = await db_insert("products", row)
+        results.append(result[0] if isinstance(result, list) and result else result)
+
+    return results
+
+
+@app.put("/api/products/{product_id}")
+async def update_product(product_id: int, request: Request):
+    """Update a single product."""
+    body = await request.json()
+    row = {}
+    field_map = {
+        "name": "name", "sku": "sku", "category": "category",
+        "price": "price", "cost": "cost", "stock": "stock",
+        "gender": "gender", "description": "description",
+    }
+    for frontend_key, db_key in field_map.items():
+        if frontend_key in body:
+            row[db_key] = body[frontend_key]
+    if "img" in body:
+        row["image_url"] = body["img"]
+        row["photo"] = body["img"]
+    if "image_url" in body:
+        row["image_url"] = body["image_url"]
+    if "sizes" in body:
+        row["sizes"] = json.dumps(body["sizes"]) if isinstance(body["sizes"], list) else body["sizes"]
+    if "is_active" in body:
+        row["is_active"] = body["is_active"]
+
+    if not row:
+        return {"ok": True}
+    return await db_update("products", row, {"id": product_id})
+
+
+@app.delete("/api/products/{product_id}")
+async def delete_product(product_id: int):
+    """Soft-delete a product (set is_active=false)."""
+    return await db_update("products", {"is_active": False}, {"id": product_id})
+
+
 # ═══════════════════════════════════════
 #  API — ОПЛАТЫ (PAYMENTS)
 # ═══════════════════════════════════════
