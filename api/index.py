@@ -311,10 +311,20 @@ async def process_incoming_message(sender_id: str, message: dict):
         maybe_single=True,
     )
 
+    # Determine preview text for conversation list
+    reply_to = message.get("reply_to", {})
+    is_story_reply = bool(reply_to.get("story"))
+    if text:
+        preview = ("📷 Відповідь на історію: " + text[:150]) if is_story_reply else text[:200]
+    elif is_story_reply:
+        preview = "📷 Відповідь на історію"
+    else:
+        preview = f"[{msg_type}]"
+
     if conv:
         conversation_id = conv["id"]
         await db_update("conversations", {
-            "last_message_text": text[:200] if text else f"[{msg_type}]",
+            "last_message_text": preview,
             "last_message_at": datetime.utcnow().isoformat(),
             "unread_count": conv.get("unread_count", 0) + 1,
             "updated_at": datetime.utcnow().isoformat(),
@@ -326,7 +336,7 @@ async def process_incoming_message(sender_id: str, message: dict):
             "instagram_username": profile.get("username", ""),
             "client_name": profile.get("name", f"User {sender_id[-4:]}"),
             "avatar_url": profile.get("profile_pic", ""),
-            "last_message_text": text[:200] if text else f"[{msg_type}]",
+            "last_message_text": preview,
             "last_message_at": datetime.utcnow().isoformat(),
             "unread_count": 1,
         })
@@ -343,14 +353,27 @@ async def process_incoming_message(sender_id: str, message: dict):
                 "name": profile.get("name", profile.get("username", "")),
             })
 
-    await db_insert("messages", {
+    # Check for story reply (Instagram sends reply_to.story with url & id)
+    metadata = None
+    reply_to = message.get("reply_to", {})
+    story = reply_to.get("story")
+    if story:
+        metadata = {"reply_to_story": {"url": story.get("url", ""), "id": story.get("id", "")}}
+        if not msg_type or msg_type == "text":
+            msg_type = "story_reply"
+
+    msg_data = {
         "conversation_id": conversation_id,
         "instagram_message_id": message_id,
         "direction": "incoming",
         "message_type": msg_type,
         "content": text,
         "media_url": media_url,
-    })
+    }
+    if metadata:
+        msg_data["metadata"] = json.dumps(metadata)
+
+    await db_insert("messages", msg_data)
 
     await maybe_auto_reply(sender_id, conversation_id)
 
