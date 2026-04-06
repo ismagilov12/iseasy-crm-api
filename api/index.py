@@ -399,7 +399,8 @@ async def send_instagram_message(
     recipient_id: str, text: str, conversation_id: Optional[int] = None
 ):
     """Отправка сообщения в Instagram Direct через Graph API."""
-    if not META_ACCESS_TOKEN or not META_PAGE_ID:
+    if not META_ACCESS_TOKEN:
+        print(f"SEND: No META_ACCESS_TOKEN, saving locally")
         if conversation_id:
             await db_insert("messages", {
                 "conversation_id": conversation_id,
@@ -409,9 +410,14 @@ async def send_instagram_message(
             })
         return {"status": "saved_locally"}
 
+    # Use INSTAGRAM_BUSINESS_ID for Instagram Messaging API
+    ig_id = INSTAGRAM_BUSINESS_ID or META_PAGE_ID
+    url = f"https://graph.instagram.com/v21.0/{ig_id}/messages"
+    print(f"SEND: POST {url} to recipient={recipient_id}")
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            f"https://graph.instagram.com/v21.0/{META_PAGE_ID}/messages",
+            url,
             json={
                 "recipient": {"id": recipient_id},
                 "message": {"text": text},
@@ -420,6 +426,7 @@ async def send_instagram_message(
         )
 
     result = resp.json()
+    print(f"SEND RESULT: {resp.status_code} {result}")
 
     if conversation_id:
         await db_insert("messages", {
