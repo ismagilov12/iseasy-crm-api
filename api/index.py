@@ -840,6 +840,32 @@ async def list_comments():
     return rows.get("data", []) if isinstance(rows, dict) else rows
 
 
+@app.get("/api/media/{media_id}")
+async def get_media_info(media_id: str):
+    """Fetch Instagram media (post) info — thumbnail, type, permalink."""
+    if not META_ACCESS_TOKEN:
+        return {"id": media_id, "media_url": "", "media_type": ""}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://graph.instagram.com/v21.0/{media_id}",
+                params={
+                    "fields": "id,media_type,media_url,thumbnail_url,permalink,caption,timestamp",
+                    "access_token": META_ACCESS_TOKEN,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # For VIDEO, use thumbnail_url as preview
+                if data.get("media_type") == "VIDEO" and not data.get("media_url"):
+                    data["media_url"] = data.get("thumbnail_url", "")
+                return data
+            print(f"Media fetch error: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Media fetch exception: {e}")
+    return {"id": media_id, "media_url": "", "media_type": ""}
+
+
 @app.get("/api/comments/by-media/{media_id}")
 async def comments_by_media(media_id: str):
     rows = await db_select("instagram_comments", filters={"instagram_media_id": media_id}, order="created_at.desc")
