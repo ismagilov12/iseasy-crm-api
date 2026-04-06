@@ -1521,8 +1521,30 @@ async def monobank_webhook(request: Request):
     amount = abs(amount_kopecks) / 100  # Convert from kopecks to UAH
     description = statement.get("description", "")
     counter_name = statement.get("counterName", "")
+    counter_iban = statement.get("counterIban", "")
     comment = statement.get("comment", "")
     tx_time = statement.get("time", 0)
+
+    # Only process incoming payments (positive amount)
+    if amount_kopecks <= 0:
+        return {"status": "ok", "skipped": "outgoing transaction"}
+
+    # Skip internal/own transfers (between own accounts, interest, etc.)
+    skip_patterns = [
+        "з гривневого рахунку",
+        "на гривневий рахунок",
+        "з картки",
+        "на картку",
+        "власний рахунок",
+        "між своїми",
+        "відсотки",
+        "кешбек",
+        "cashback",
+    ]
+    desc_lower = description.lower()
+    if any(pat in desc_lower for pat in skip_patterns) and not counter_iban:
+        print(f"[MONO] Skipping internal transfer: {description}")
+        return {"status": "ok", "skipped": "internal transfer"}
 
     # Extract payer name: prefer counterName, fallback to description parsing
     payer_name = counter_name
@@ -1532,11 +1554,11 @@ async def monobank_webhook(request: Request):
         if match:
             payer_name = match.group(1).strip()
         else:
-            payer_name = description
-
-    # Only process incoming payments (positive amount)
-    if amount_kopecks <= 0:
-        return {"status": "ok", "skipped": "outgoing transaction"}
+            # Skip if description looks like system text, not a person name
+            if len(description) > 50 or any(c.isdigit() for c in description[:3]):
+                payer_name = description[:50]
+            else:
+                payer_name = description
 
     print(f"[MONO] Webhook received: id={mono_id}, amount={amount}, payer={payer_name}")
 
