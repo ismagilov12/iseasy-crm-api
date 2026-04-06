@@ -197,8 +197,19 @@ async def webhook_verify(
 
 @app.post("/webhook")
 async def webhook_receive(request: Request):
-    """Приём сообщений из Instagram Direct + комментариев (POST)."""
+    """Приём сообщений из Instagram Direct + комментариев (POST).
+    Also detects WayForPay webhook data and routes accordingly."""
     body = await request.body()
+
+    # Try to detect WayForPay data (has merchantAccount or transactionStatus)
+    try:
+        peek = json.loads(body)
+        if isinstance(peek, dict) and ("merchantAccount" in peek or "transactionStatus" in peek or "orderReference" in peek):
+            print("[WEBHOOK] Detected WayForPay data, routing to wayforpay handler")
+            # Re-create request-like call to wayforpay handler
+            return await wayforpay_webhook(request, _body_override=peek)
+    except Exception:
+        pass
 
     # Signature verification (temporarily logging only, not blocking)
     if META_APP_SECRET:
@@ -1324,7 +1335,7 @@ async def _auto_match_payment(payment_id: int, payer_name: str, amount: float):
 # ── WayForPay Webhook ──
 
 @app.post("/webhook/wayforpay")
-async def wayforpay_webhook(request: Request):
+async def wayforpay_webhook(request: Request, _body_override: dict = None):
     """
     WayForPay sends POST with JSON:
     {
@@ -1348,10 +1359,13 @@ async def wayforpay_webhook(request: Request):
       "signature": "<hmac_md5>"
     }
     """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    if _body_override is not None:
+        body = _body_override
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
 
     tx_status = body.get("transactionStatus", "")
     order_ref = body.get("orderReference", "")
@@ -1361,7 +1375,17 @@ async def wayforpay_webhook(request: Request):
     currency = body.get("currency", "UAH")
     auth_code = body.get("authCode", "")
 
-    print(f"[WFP] Webhook received: status={tx_status}, ref={order_ref}, amount={amount}, payer={payer_name}")
+    # Extract exact payment time from WFP data
+    wfp_created = body.get("createdDate", "") or body.get("processingDate", "")
+    if wfp_created and isinstance(wfp_created, (int, float)):
+        # Unix timestamp
+        payment_dt = datetime.utcfromtimestamp(wfp_created).isoformat()
+    elif wfp_created and isinstance(wfp_created, str) and wfp_created.isdigit():
+        payment_dt = datetime.utcfromtimestamp(int(wfp_created)).isoformat()
+    else:
+        payment_dt = datetime.utcnow().isoformat()
+
+    print(f"[WFP] Webhook received: status={tx_status}, ref={order_ref}, amount={amount}, payer={payer_name}, time={payment_dt}")
 
     # Only process successful payments
     pay_status = "success" if tx_status == "Approved" else tx_status.lower()
@@ -1375,7 +1399,7 @@ async def wayforpay_webhook(request: Request):
         "currency": currency,
         "status": pay_status,
         "raw_data": json.dumps(body),
-        "payment_date": datetime.utcnow().isoformat(),
+        "payment_date": payment_dt,
     }
     result = await db_insert("payments", payment_data)
     payment_id = None
