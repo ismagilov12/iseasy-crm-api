@@ -911,10 +911,19 @@ async def get_settings():
 @app.patch("/api/settings/{key}")
 async def update_setting(key: str, request: Request):
     body = await request.json()
-    return await db_update("bot_settings", {
+    # Try update first
+    result = await db_update("bot_settings", {
         "value": body,
         "updated_at": datetime.utcnow().isoformat(),
     }, {"key": key})
+    # If no rows updated (empty list), insert new row
+    if not result or (isinstance(result, list) and len(result) == 0):
+        result = await db_insert("bot_settings", {
+            "key": key,
+            "value": body,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+    return result
 
 
 # ═══════════════════════════════════════
@@ -1487,7 +1496,25 @@ async def monobank_webhook(request: Request):
         body = {}
 
     data = body.get("data", {})
+    account_id = data.get("account", "")
     statement = data.get("statementItem", {})
+
+    # Check if this account is in our selected accounts list
+    mono_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "monobank"}, maybe_single=True,
+    )
+    if mono_settings and isinstance(mono_settings, dict):
+        val = mono_settings.get("value", {})
+        if isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except Exception:
+                val = {}
+        selected_accounts = val.get("selected_accounts", [])
+        if selected_accounts and account_id and account_id not in selected_accounts:
+            print(f"[MONO] Skipping: account {account_id} not in selected accounts {selected_accounts}")
+            return {"status": "ok", "skipped": "account not selected"}
 
     mono_id = statement.get("id", "")
     amount_kopecks = statement.get("amount", 0)
@@ -1570,12 +1597,23 @@ async def setup_monobank_webhook(request: Request):
             client_name = info.get("name", "")
             accounts = info.get("accounts", [])
             # Find UAH account (currencyCode 980)
-            uah_accounts = [a for a in accounts if a.get("currencyCode") == 980]
+            uah_accounts = [
+                {
+                    "id": a.get("id", ""),
+                    "balance": a.get("balance", 0) / 100,
+                    "type": a.get("type", ""),
+                    "maskedPan": (a.get("maskedPan", [None]) or [None])[0] or "",
+                    "iban": a.get("iban", ""),
+                }
+                for a in accounts
+                if a.get("currencyCode") == 980
+            ]
 
             return {
                 "status": "ok",
                 "client_name": client_name,
                 "accounts": len(uah_accounts),
+                "accounts_list": uah_accounts,
                 "webhook_set": True,
             }
         else:
@@ -1585,6 +1623,42 @@ async def setup_monobank_webhook(request: Request):
                 "code": resp.status_code,
                 "error": error_text,
             }
+
+
+@app.post("/api/monobank/accounts")
+async def get_monobank_accounts(request: Request):
+    """Get list of Monobank UAH accounts for account selection."""
+    body = await request.json()
+    token = body.get("token", "")
+    if not token:
+        raise HTTPException(400, "Monobank API token is required")
+
+    async with httpx.AsyncClient() as client:
+        info_resp = await client.get(
+            "https://api.monobank.ua/personal/client-info",
+            headers={"X-Token": token},
+        )
+        if info_resp.status_code != 200:
+            return {"status": "error", "error": info_resp.text}
+        info = info_resp.json()
+        client_name = info.get("name", "")
+        accounts = info.get("accounts", [])
+        uah_accounts = [
+            {
+                "id": a.get("id", ""),
+                "balance": a.get("balance", 0) / 100,
+                "type": a.get("type", ""),
+                "maskedPan": (a.get("maskedPan", [None]) or [None])[0] or "",
+                "iban": a.get("iban", ""),
+            }
+            for a in accounts
+            if a.get("currencyCode") == 980
+        ]
+        return {
+            "status": "ok",
+            "client_name": client_name,
+            "accounts_list": uah_accounts,
+        }
 
 
 # ── Manual payment matching ──
