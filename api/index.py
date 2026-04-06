@@ -549,7 +549,31 @@ async def update_conversation(conv_id: int, request: Request):
     """Обновление разговора (теги, заметки, статус, воронка, назначение)."""
     body = await request.json()
     body["updated_at"] = datetime.utcnow().isoformat()
-    return await db_update("conversations", body, {"id": conv_id})
+
+    # Check if funnel is changing — trigger automations
+    old_funnel = None
+    new_funnel = body.get("funnel")
+    if new_funnel:
+        try:
+            conv = await db_select("conversations", filters={"id": conv_id}, single=True)
+            old_funnel = conv.get("funnel", "")
+        except Exception:
+            pass
+
+    result = await db_update("conversations", body, {"id": conv_id})
+
+    # Fire automations if funnel changed
+    if new_funnel and old_funnel and new_funnel != old_funnel:
+        try:
+            await run_automations("funnel_change", {
+                "conversation_id": conv_id,
+                "old_funnel": old_funnel,
+                "new_funnel": new_funnel,
+            })
+        except Exception as e:
+            print(f"[AUTOMATIONS] funnel_change error: {e}")
+
+    return result
 
 
 @app.post("/api/conversations/{conv_id}/read")
@@ -1209,6 +1233,224 @@ async def data_deletion_callback(request: Request):
         }
     except Exception:
         return {"url": "https://iseasy-crm-api.vercel.app/data-deletion", "confirmation_code": "iseasy_error"}
+
+
+# ═══════════════════════════════════════
+#  FUNNEL STAGES (stored in bot_settings)
+# ═══════════════════════════════════════
+
+DEFAULT_FUNNELS = [
+    {"id": "new", "label": "Нові", "color": "#3b82f6", "icon": "💬"},
+    {"id": "processing", "label": "На оформлення", "color": "#f59e0b", "icon": "📋"},
+    {"id": "payment", "label": "На оплату", "color": "#8b5cf6", "icon": "💳"},
+    {"id": "confirmed", "label": "Оформлено", "color": "#10b981", "icon": "✅"},
+    {"id": "shipped", "label": "Відправлено", "color": "#06b6d4", "icon": "📦"},
+    {"id": "received", "label": "Отримано", "color": "#059669", "icon": "🎉"},
+    {"id": "exchange", "label": "Обмін", "color": "#f97316", "icon": "🔄"},
+    {"id": "repair", "label": "Ремонт", "color": "#dc2626", "icon": "🔧"},
+    {"id": "closed", "label": "Закрито", "color": "#6b7280", "icon": "✕"},
+    {"id": "archived", "label": "Архів", "color": "#9ca3af", "icon": "📁"},
+]
+
+
+@app.get("/api/funnels")
+async def get_funnels():
+    """Get funnel stages from settings, or return defaults."""
+    row = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "funnel_stages"}, maybe_single=True,
+    )
+    if row and isinstance(row, dict):
+        val = row.get("value", [])
+        if isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except Exception:
+                val = DEFAULT_FUNNELS
+        if isinstance(val, list) and len(val) > 0:
+            return val
+    return DEFAULT_FUNNELS
+
+
+@app.put("/api/funnels")
+async def save_funnels(request: Request):
+    """Save funnel stages to settings."""
+    stages = await request.json()
+    if not isinstance(stages, list):
+        raise HTTPException(400, "Expected array of funnel stages")
+
+    # Upsert into bot_settings
+    existing = await db_select(
+        "bot_settings", columns="id",
+        filters={"key": "funnel_stages"}, maybe_single=True,
+    )
+    if existing and isinstance(existing, dict) and existing.get("id"):
+        await db_update("bot_settings", {
+            "value": json.dumps(stages),
+            "updated_at": datetime.utcnow().isoformat(),
+        }, {"key": "funnel_stages"})
+    else:
+        await db_insert("bot_settings", {
+            "key": "funnel_stages",
+            "value": json.dumps(stages),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+    return {"status": "ok", "count": len(stages)}
+
+
+# ═══════════════════════════════════════
+#  AUTOMATIONS (CRUD + engine)
+# ═══════════════════════════════════════
+
+@app.get("/api/automations")
+async def list_automations():
+    """Get all automation rules."""
+    return await db_select("automations", order="created_at.desc", limit=100)
+
+
+@app.post("/api/automations")
+async def create_automation(request: Request):
+    """Create a new automation rule."""
+    body = await request.json()
+    data = {
+        "name": body.get("name", ""),
+        "trigger_type": body.get("trigger_type", "funnel_change"),
+        "trigger_text": body.get("trigger_text", ""),
+        "actions": json.dumps(body.get("actions", [])),
+        "is_active": body.get("is_active", True),
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    result = await db_insert("automations", data)
+    return result[0] if isinstance(result, list) and result else result
+
+
+@app.patch("/api/automations/{auto_id}")
+async def update_automation(auto_id: int, request: Request):
+    """Update an automation rule."""
+    body = await request.json()
+    update_data = {"updated_at": datetime.utcnow().isoformat()}
+    for field in ["name", "trigger_type", "trigger_text", "is_active"]:
+        if field in body:
+            update_data[field] = body[field]
+    if "actions" in body:
+        update_data["actions"] = json.dumps(body["actions"]) if isinstance(body["actions"], list) else body["actions"]
+    result = await db_update("automations", update_data, {"id": auto_id})
+    return result[0] if isinstance(result, list) and result else {"status": "ok"}
+
+
+@app.delete("/api/automations/{auto_id}")
+async def delete_automation(auto_id: int):
+    """Delete an automation rule."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{REST_URL}/automations?id=eq.{auto_id}",
+            headers=_h(),
+        )
+    return {"status": "ok"} if resp.status_code in (200, 204) else {"status": "error"}
+
+
+async def run_automations(trigger_type: str, context: dict):
+    """
+    Execute matching automations.
+    trigger_type: 'funnel_change', 'new_message', 'payment_received', 'order_created'
+    context: {conversation_id, old_funnel, new_funnel, message_text, ...}
+    """
+    try:
+        autos = await db_select(
+            "automations",
+            filters={"trigger_type": trigger_type, "is_active": True},
+        )
+        if not isinstance(autos, list):
+            return
+
+        for auto in autos:
+            trigger_text = auto.get("trigger_text", "")
+            actions = auto.get("actions", [])
+            if isinstance(actions, str):
+                try:
+                    actions = json.loads(actions)
+                except Exception:
+                    actions = []
+
+            should_run = False
+
+            if trigger_type == "funnel_change":
+                # trigger_text = target funnel id, e.g. "processing"
+                if trigger_text == context.get("new_funnel", ""):
+                    should_run = True
+            elif trigger_type == "new_message":
+                # trigger_text = keyword to match
+                msg = context.get("message_text", "").lower()
+                if trigger_text.lower() in msg:
+                    should_run = True
+            elif trigger_type in ("payment_received", "order_created"):
+                should_run = True  # Always fire for these triggers
+
+            if not should_run:
+                continue
+
+            # Execute actions
+            conv_id = context.get("conversation_id")
+            for action in actions:
+                atype = action.get("type", "")
+                if atype == "send_message" and conv_id:
+                    msg_text = action.get("text", "")
+                    if msg_text:
+                        await _send_message_to_conversation(conv_id, msg_text)
+                elif atype == "change_funnel" and conv_id:
+                    new_f = action.get("funnel", "")
+                    if new_f:
+                        await db_update("conversations", {"funnel": new_f}, {"id": conv_id})
+                elif atype == "add_tag" and conv_id:
+                    tag = action.get("tag", "")
+                    if tag:
+                        # Append tag to conversation tags array
+                        conv = await db_select("conversations", filters={"id": conv_id}, single=True)
+                        tags = conv.get("tags", []) or []
+                        if tag not in tags:
+                            tags.append(tag)
+                            await db_update("conversations", {"tags": tags}, {"id": conv_id})
+
+            # Increment run count
+            await db_update("automations", {
+                "run_count": (auto.get("run_count", 0) or 0) + 1,
+                "updated_at": datetime.utcnow().isoformat(),
+            }, {"id": auto["id"]})
+
+    except Exception as e:
+        print(f"[AUTOMATIONS] Error: {e}")
+
+
+async def _send_message_to_conversation(conv_id: int, text: str):
+    """Send a message in a conversation (outgoing)."""
+    conv = await db_select("conversations", filters={"id": conv_id}, single=True)
+    ig_user_id = conv.get("instagram_user_id", "")
+
+    # Save to DB
+    await db_insert("messages", {
+        "conversation_id": conv_id,
+        "direction": "outgoing",
+        "content": text,
+        "message_type": "text",
+        "created_at": datetime.utcnow().isoformat(),
+    })
+
+    # Send via Instagram API if possible
+    if ig_user_id and META_ACCESS_TOKEN:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"https://graph.instagram.com/v21.0/me/messages",
+                    json={
+                        "recipient": {"id": ig_user_id},
+                        "message": {"text": text},
+                    },
+                    params={"access_token": META_ACCESS_TOKEN},
+                )
+        except Exception as e:
+            print(f"[AUTO MSG] Instagram send error: {e}")
 
 
 # ═══════════════════════════════════════
