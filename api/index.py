@@ -218,8 +218,19 @@ async def webhook_receive(request: Request):
         # Direct Messages
         for messaging in entry.get("messaging", []):
             sender_id = messaging.get("sender", {}).get("id", "")
+            recipient_id = messaging.get("recipient", {}).get("id", "")
             message = messaging.get("message", {})
-            if message and sender_id != META_PAGE_ID:
+            if not message:
+                continue
+
+            # Detect echo (message sent BY the business account)
+            is_echo = message.get("is_echo", False)
+            is_from_page = sender_id in (META_PAGE_ID, INSTAGRAM_BUSINESS_ID)
+
+            if is_echo or is_from_page:
+                # Save outgoing message (sent from Instagram directly, not via CRM)
+                await process_echo_message(recipient_id, message)
+            else:
                 await process_incoming_message(sender_id, message)
 
         # Comments on posts
@@ -228,6 +239,49 @@ async def webhook_receive(request: Request):
                 await process_incoming_comment(change.get("value", {}))
 
     return {"status": "ok"}
+
+
+async def process_echo_message(recipient_id: str, message: dict):
+    """Process echo message (sent BY the business, received as webhook echo)."""
+    message_id = message.get("mid", "")
+    text = message.get("text", "")
+
+    # Find conversation by recipient (the customer)
+    conv = await db_select(
+        "conversations",
+        filters={"instagram_user_id": recipient_id},
+        maybe_single=True,
+    )
+    if not conv:
+        return  # No conversation for this recipient
+
+    # Check if this message already exists (avoid duplicates from CRM sends)
+    existing = await db_select(
+        "messages",
+        filters={"instagram_message_id": message_id},
+        maybe_single=True,
+    )
+    if existing:
+        # Already saved (e.g. sent from CRM) — make sure direction is outgoing
+        if existing.get("direction") != "outgoing":
+            await db_update("messages", {"direction": "outgoing"}, {"id": existing["id"]})
+        return
+
+    conversation_id = conv["id"]
+    await db_insert("messages", {
+        "conversation_id": conversation_id,
+        "instagram_message_id": message_id,
+        "direction": "outgoing",
+        "message_type": "text",
+        "content": text,
+    })
+
+    await db_update("conversations", {
+        "last_message_text": text[:200] if text else "[outgoing]",
+        "last_message_at": datetime.utcnow().isoformat(),
+        "last_message_dir": "out",
+        "updated_at": datetime.utcnow().isoformat(),
+    }, {"id": conversation_id})
 
 
 async def process_incoming_message(sender_id: str, message: dict):
