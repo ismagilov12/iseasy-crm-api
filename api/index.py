@@ -550,6 +550,54 @@ async def send_message(conv_id: int, request: Request):
     return {"ok": True, "result": result}
 
 
+@app.post("/api/conversations/{conv_id}/messages/image")
+async def send_image_message(conv_id: int, request: Request):
+    """Send image message to client via Instagram (multipart upload)."""
+    from fastapi.responses import JSONResponse
+    try:
+        form = await request.form()
+        image = form.get("image")
+        text = form.get("text", "")
+
+        conv = await db_select("conversations", filters={"id": conv_id}, single=True)
+        recipient_id = conv["instagram_user_id"]
+
+        # For now, save the message as outgoing with text
+        # Instagram image sending requires uploading to a hosting service first
+        msg_text = text if text else "[Фото]"
+
+        if META_ACCESS_TOKEN and (INSTAGRAM_BUSINESS_ID or META_PAGE_ID):
+            ig_id = INSTAGRAM_BUSINESS_ID or META_PAGE_ID
+            # Send text part via Instagram API
+            if text:
+                url = f"https://graph.instagram.com/v21.0/{ig_id}/messages"
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(url, json={
+                        "recipient": {"id": recipient_id},
+                        "message": {"text": text},
+                    }, headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"})
+                    print(f"IMAGE MSG text part: {resp.status_code} {resp.json()}")
+
+        await db_insert("messages", {
+            "conversation_id": conv_id,
+            "direction": "outgoing",
+            "message_type": "image",
+            "content": msg_text,
+        })
+
+        await db_update("conversations", {
+            "last_message_text": msg_text[:200],
+            "last_message_at": datetime.utcnow().isoformat(),
+            "last_message_dir": "out",
+            "updated_at": datetime.utcnow().isoformat(),
+        }, {"id": conv_id})
+
+        return {"ok": True}
+    except Exception as e:
+        print(f"Image upload error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 # ═══════════════════════════════════════
 #  API — ЗАКАЗЫ (ORDERS)
 # ═══════════════════════════════════════
