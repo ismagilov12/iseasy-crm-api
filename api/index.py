@@ -903,7 +903,32 @@ async def list_clients(search: str = "", limit: int = 50):
 @app.post("/api/clients")
 async def create_client(request: Request):
     body = await request.json()
-    return await db_insert("clients", body)
+    conversation_id = body.pop("conversation_id", None)
+    # Also pop 'branch' → map to 'np_branch' (clients table uses np_branch)
+    branch = body.pop("branch", None)
+    if branch:
+        body["np_branch"] = branch
+    result = await db_insert("clients", body)
+    # If linked to a conversation, update conversation's client_data and client_id
+    if conversation_id and result:
+        client = result[0] if isinstance(result, list) else result
+        client_id = client.get("id")
+        client_data = {
+            "id": client_id,
+            "surname": body.get("surname", ""),
+            "name": body.get("name", ""),
+            "phone": body.get("phone", ""),
+            "city": body.get("city", ""),
+            "branch": branch or body.get("np_branch", ""),
+        }
+        update_payload = {
+            "client_data": json.dumps(client_data),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if client_id:
+            update_payload["client_id"] = client_id
+        await db_update("conversations", update_payload, {"id": conversation_id})
+    return result
 
 
 @app.patch("/api/clients/{client_id}")
