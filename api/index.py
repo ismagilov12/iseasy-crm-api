@@ -1795,3 +1795,160 @@ async def payments_by_conversation(conversation_id: int):
         order="payment_date.desc",
         limit=50,
     )
+
+
+# ── Monobank: Sync historical statements ──
+
+@app.post("/api/monobank/sync")
+async def monobank_sync_statements(request: Request):
+    """
+    Fetch historical transactions from Monobank statement API
+    for the last N days and insert new ones into payments table.
+    GET /personal/statement/{account}/{from}/{to}
+    """
+    body = await request.json()
+    days = body.get("days", 3)
+
+    # Get monobank settings (token + selected_accounts)
+    mono_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "monobank"}, maybe_single=True,
+    )
+    if not mono_settings:
+        raise HTTPException(400, "Monobank not configured. Save token in settings first.")
+
+    val = mono_settings.get("value", {}) if isinstance(mono_settings, dict) else {}
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except Exception:
+            val = {}
+
+    token = val.get("api_token", "")
+    if not token:
+        raise HTTPException(400, "Monobank API token not found in settings")
+
+    selected_accounts = val.get("selected_accounts", [])
+
+    # If no accounts selected, get all UAH accounts
+    if not selected_accounts:
+        async with httpx.AsyncClient() as client:
+            info_resp = await client.get(
+                "https://api.monobank.ua/personal/client-info",
+                headers={"X-Token": token},
+            )
+            if info_resp.status_code == 200:
+                info = info_resp.json()
+                selected_accounts = [
+                    a["id"] for a in info.get("accounts", [])
+                    if a.get("currencyCode") == 980
+                ]
+
+    if not selected_accounts:
+        return {"status": "error", "error": "No UAH accounts found"}
+
+    now = int(datetime.utcnow().timestamp())
+    from_time = now - (days * 86400)
+
+    skip_patterns = [
+        "з гривневого рахунку", "на гривневий рахунок",
+        "з картки", "на картку", "власний рахунок",
+        "між своїми", "відсотки", "кешбек", "cashback",
+    ]
+
+    total_synced = 0
+    total_skipped = 0
+    errors = []
+
+    for account_id in selected_accounts:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                url = f"https://api.monobank.ua/personal/statement/{account_id}/{from_time}/{now}"
+                resp = await client.get(url, headers={"X-Token": token})
+
+            if resp.status_code == 429:
+                errors.append(f"Account {account_id[-4:]}: rate limited (wait 60s)")
+                continue
+            if resp.status_code != 200:
+                errors.append(f"Account {account_id[-4:]}: HTTP {resp.status_code}")
+                continue
+
+            items = resp.json()
+            if not isinstance(items, list):
+                continue
+
+            for stmt in items:
+                amount_kopecks = stmt.get("amount", 0)
+                # Only incoming payments
+                if amount_kopecks <= 0:
+                    total_skipped += 1
+                    continue
+
+                description = stmt.get("description", "")
+                counter_name = stmt.get("counterName", "")
+                counter_iban = stmt.get("counterIban", "")
+                desc_lower = description.lower()
+
+                # Skip internal transfers
+                if any(pat in desc_lower for pat in skip_patterns) and not counter_iban:
+                    total_skipped += 1
+                    continue
+
+                mono_id = stmt.get("id", "")
+                amount = abs(amount_kopecks) / 100
+                comment = stmt.get("comment", "")
+                tx_time = stmt.get("time", 0)
+
+                # Check if already exists by external_id
+                existing = await db_select(
+                    "payments", columns="id",
+                    filters={"external_id": mono_id}, maybe_single=True,
+                )
+                if existing and (isinstance(existing, dict) and existing.get("id")):
+                    total_skipped += 1
+                    continue
+
+                # Extract payer name
+                payer_name = counter_name
+                if not payer_name and description:
+                    match = re.search(r"(?:Від|від|From|from)[:\s]+(.+)", description)
+                    if match:
+                        payer_name = match.group(1).strip()
+                    else:
+                        payer_name = description[:50]
+
+                payment_date = datetime.utcfromtimestamp(tx_time).isoformat() if tx_time else datetime.utcnow().isoformat()
+
+                payment_data = {
+                    "source": "monobank",
+                    "external_id": mono_id,
+                    "payer_name": payer_name,
+                    "amount": amount,
+                    "currency": "UAH",
+                    "status": "success",
+                    "raw_data": json.dumps({"statementItem": stmt, "account": account_id}),
+                    "payment_date": payment_date,
+                }
+                try:
+                    result = await db_insert("payments", payment_data)
+                    total_synced += 1
+                    # Auto-match
+                    pid = None
+                    if isinstance(result, list) and result:
+                        pid = result[0].get("id")
+                    elif isinstance(result, dict):
+                        pid = result.get("id")
+                    if pid and payer_name:
+                        await _auto_match_payment(pid, payer_name, amount)
+                except Exception as e:
+                    print(f"[MONO SYNC] Insert error: {e}")
+
+        except Exception as e:
+            errors.append(f"Account {account_id[-4:]}: {str(e)}")
+
+    return {
+        "status": "ok",
+        "synced": total_synced,
+        "skipped": total_skipped,
+        "errors": errors,
+    }
