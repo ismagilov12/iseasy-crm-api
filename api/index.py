@@ -2472,7 +2472,7 @@ async def np_search_cities(q: str = "", limit: int = 20):
 
 
 @app.get("/api/nova-poshta/warehouses")
-async def np_search_warehouses(city_ref: str = "", q: str = "", limit: int = 50):
+async def np_search_warehouses(city_ref: str = "", q: str = "", limit: int = 500):
     """Search warehouses/postomat by city ref."""
     api_key = await _get_np_key()
     props = {"Limit": str(limit)}
