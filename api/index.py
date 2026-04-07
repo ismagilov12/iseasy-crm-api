@@ -778,8 +778,8 @@ async def notify_order(order_id: int):
     messages = {
         "new": "Ваше замовлення оформлено! Очікуйте на підтвердження",
         "production": "Ваше замовлення на виробництві. Скоро буде готове!",
-        "shipped": f"Ваше замовлення відправлено! ТТН: {ttn}",
-        "at_post": "Ваше замовлення на пошті! Заберіть, будь ласка",
+        "shipped": f"Ваше замовлення відправлено! ТТН: {ttn}\nВідстежити: https://novaposhta.ua/tracking/?cargo_number={ttn}" if ttn else "Ваше замовлення відправлено!",
+        "at_post": f"Ваше замовлення на пошті! Заберіть, будь ласка 📦\nТТН: {ttn}" if ttn else "Ваше замовлення на пошті! Заберіть, будь ласка",
         "received": "Дякуємо за покупку! Будемо раді бачити вас знову!",
     }
 
@@ -2348,3 +2348,357 @@ async def _sync_wayforpay(days: int = 3):
         errors.append(f"WFP: {str(e)}")
 
     return synced, errors
+
+
+# ═══════════════════════════════════════
+#  НОВА ПОШТА — API ІНТЕГРАЦІЯ
+# ═══════════════════════════════════════
+
+NP_API_URL = "https://api.novaposhta.ua/v2.0/json/"
+
+
+async def _np_call(api_key: str, model: str, method: str, props: dict = None):
+    """Universal Nova Poshta API v2.0 caller."""
+    payload = {
+        "apiKey": api_key,
+        "modelName": model,
+        "calledMethod": method,
+        "methodProperties": props or {},
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(NP_API_URL, json=payload)
+    data = resp.json()
+    if not data.get("success"):
+        errors = data.get("errors", [])
+        raise HTTPException(400, detail=f"Nova Poshta API error: {'; '.join(errors)}")
+    return data.get("data", [])
+
+
+async def _get_np_key() -> str:
+    """Get Nova Poshta API key from bot_settings."""
+    settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "nova_poshta"}, maybe_single=True,
+    )
+    if not settings or not isinstance(settings, dict):
+        raise HTTPException(400, "Nova Poshta не налаштовано. Збережіть API ключ в налаштуваннях.")
+    val = settings.get("value", {})
+    api_key = val.get("apiKey", "")
+    if not api_key:
+        raise HTTPException(400, "API ключ Нова Пошта не знайдено в налаштуваннях")
+    return api_key
+
+
+@app.post("/api/nova-poshta/test-key")
+async def np_test_key(request: Request):
+    """Test Nova Poshta API key validity."""
+    body = await request.json()
+    api_key = body.get("apiKey", "")
+    if not api_key:
+        raise HTTPException(400, "API ключ не вказано")
+    try:
+        result = await _np_call(api_key, "Counterparty", "getCounterparties", {
+            "CounterpartyProperty": "Sender",
+            "Page": "1",
+        })
+        sender = result[0] if result else {}
+        return {
+            "ok": True,
+            "sender": {
+                "ref": sender.get("Ref", ""),
+                "description": sender.get("Description", ""),
+                "city": sender.get("City", ""),
+                "ownershipForm": sender.get("OwnershipForm", ""),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/nova-poshta/sender-info")
+async def np_sender_info():
+    """Get sender counterparty info (name, ref, contact persons, addresses)."""
+    api_key = await _get_np_key()
+    counterparties = await _np_call(api_key, "Counterparty", "getCounterparties", {
+        "CounterpartyProperty": "Sender",
+        "Page": "1",
+    })
+    if not counterparties:
+        return {"counterparties": [], "addresses": [], "contacts": []}
+
+    sender_ref = counterparties[0].get("Ref", "")
+
+    # Get sender addresses
+    addresses = await _np_call(api_key, "Counterparty", "getCounterpartyAddresses", {
+        "Ref": sender_ref,
+        "CounterpartyProperty": "Sender",
+    })
+
+    # Get sender contact persons
+    contacts = await _np_call(api_key, "Counterparty", "getCounterpartyContactPersons", {
+        "Ref": sender_ref,
+        "Page": "1",
+    })
+
+    return {
+        "counterparties": counterparties,
+        "addresses": addresses,
+        "contacts": contacts,
+    }
+
+
+@app.get("/api/nova-poshta/cities")
+async def np_search_cities(q: str = "", limit: int = 20):
+    """Search cities by name."""
+    api_key = await _get_np_key()
+    result = await _np_call(api_key, "Address", "searchSettlements", {
+        "CityName": q,
+        "Limit": str(limit),
+    })
+    # searchSettlements returns nested Addresses array
+    addresses = []
+    for item in result:
+        for addr in item.get("Addresses", []):
+            addresses.append({
+                "ref": addr.get("DeliveryCity", addr.get("Ref", "")),
+                "name": addr.get("MainDescription", "") or addr.get("Present", ""),
+                "area": addr.get("Area", ""),
+                "region": addr.get("Region", ""),
+                "present": addr.get("Present", ""),
+            })
+    return addresses
+
+
+@app.get("/api/nova-poshta/warehouses")
+async def np_search_warehouses(city_ref: str = "", q: str = "", limit: int = 50):
+    """Search warehouses/postomat by city ref."""
+    api_key = await _get_np_key()
+    props = {"Limit": str(limit)}
+    if city_ref:
+        props["CityRef"] = city_ref
+    if q:
+        props["FindByString"] = q
+    result = await _np_call(api_key, "Address", "getWarehouses", props)
+    return [
+        {
+            "ref": w.get("Ref", ""),
+            "number": w.get("Number", ""),
+            "description": w.get("Description", ""),
+            "shortAddress": w.get("ShortAddress", ""),
+            "phone": w.get("Phone", ""),
+            "typeOfWarehouse": w.get("TypeOfWarehouse", ""),
+            "cityRef": w.get("CityRef", ""),
+            "cityDescription": w.get("CityDescription", ""),
+            "maxWeight": w.get("TotalMaxWeightAllowed", ""),
+            "schedule": {
+                "mon": w.get("Schedule", {}).get("Monday", ""),
+                "sat": w.get("Schedule", {}).get("Saturday", ""),
+                "sun": w.get("Schedule", {}).get("Sunday", ""),
+            } if isinstance(w.get("Schedule"), dict) else {},
+        }
+        for w in result
+    ]
+
+
+@app.post("/api/nova-poshta/create-ttn")
+async def np_create_ttn(request: Request):
+    """Create an internet document (TTN) via Nova Poshta API."""
+    body = await request.json()
+    api_key = await _get_np_key()
+
+    # Get sender settings from DB
+    np_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "nova_poshta"}, maybe_single=True,
+    )
+    val = np_settings.get("value", {}) if np_settings else {}
+
+    sender_ref = val.get("senderRef", "")
+    sender_address = val.get("senderAddressRef", "")
+    sender_contact = val.get("senderContactRef", "")
+    sender_phone = val.get("senderPhone", "")
+
+    if not all([sender_ref, sender_address, sender_contact]):
+        raise HTTPException(400, "Налаштуйте відправника в налаштуваннях Нова Пошта (контрагент, адреса, контакт)")
+
+    # Required fields from request
+    recipient_name = body.get("recipientName", "")
+    recipient_phone = body.get("recipientPhone", "")
+    recipient_city_ref = body.get("recipientCityRef", "")
+    recipient_warehouse_ref = body.get("recipientWarehouseRef", "")
+    weight = body.get("weight", "0.5")
+    cost = body.get("cost", 0)
+    description = body.get("description", "Взуття")
+    payer_type = body.get("payerType", "Recipient")
+    payment_method = body.get("paymentMethod", "Cash")
+    cargo_type = body.get("cargoType", "Parcel")
+    seats_amount = body.get("seatsAmount", "1")
+
+    # Backward delivery (наложка)
+    backward_delivery = []
+    cod_amount = body.get("codAmount", 0)
+    if cod_amount and float(cod_amount) > 0:
+        backward_delivery = [{
+            "PayerType": "Recipient",
+            "CargoType": "Money",
+            "RedeliveryString": str(cod_amount),
+        }]
+
+    props = {
+        "PayerType": payer_type,
+        "PaymentMethod": payment_method,
+        "DateTime": datetime.utcnow().strftime("%d.%m.%Y"),
+        "CargoType": cargo_type,
+        "Weight": str(weight),
+        "ServiceType": "WarehouseWarehouse",
+        "SeatsAmount": str(seats_amount),
+        "Description": description,
+        "Cost": str(cost),
+        "CitySender": val.get("senderCityRef", ""),
+        "Sender": sender_ref,
+        "SenderAddress": sender_address,
+        "ContactSender": sender_contact,
+        "SendersPhone": sender_phone,
+        "CityRecipient": recipient_city_ref,
+        "Recipient": "",
+        "RecipientAddress": recipient_warehouse_ref,
+        "ContactRecipient": "",
+        "RecipientsPhone": recipient_phone,
+        "NewAddress": "1",
+    }
+
+    # If recipient is a private person, create on the fly
+    if recipient_name and recipient_phone:
+        # Split name: Прізвище Ім'я По-батькові
+        name_parts = recipient_name.strip().split()
+        last_name = name_parts[0] if name_parts else ""
+        first_name = name_parts[1] if len(name_parts) > 1 else ""
+        middle_name = name_parts[2] if len(name_parts) > 2 else ""
+
+        # Create recipient counterparty
+        try:
+            cp_result = await _np_call(api_key, "Counterparty", "save", {
+                "FirstName": first_name,
+                "MiddleName": middle_name,
+                "LastName": last_name,
+                "Phone": recipient_phone,
+                "Email": "",
+                "CounterpartyType": "PrivatePerson",
+                "CounterpartyProperty": "Recipient",
+            })
+            if cp_result:
+                props["Recipient"] = cp_result[0].get("Ref", "")
+                contact_persons = cp_result[0].get("ContactPerson", {}).get("data", [])
+                if contact_persons:
+                    props["ContactRecipient"] = contact_persons[0].get("Ref", "")
+        except Exception as e:
+            print(f"[NP] Failed to create recipient counterparty: {e}")
+            raise HTTPException(400, f"Помилка створення отримувача: {e}")
+
+    if backward_delivery:
+        props["BackwardDeliveryData"] = backward_delivery
+
+    result = await _np_call(api_key, "InternetDocument", "save", props)
+
+    if result:
+        doc = result[0]
+        ttn = doc.get("IntDocNumber", "")
+        doc_ref = doc.get("Ref", "")
+        estimated_cost = doc.get("CostOnSite", 0)
+
+        # Update order with TTN if order_id provided
+        order_id = body.get("orderId")
+        if order_id:
+            await db_update("orders", {
+                "ttn": ttn,
+                "np_doc_ref": doc_ref,
+                "status": "shipped",
+                "updated_at": datetime.utcnow().isoformat(),
+            }, {"id": order_id})
+
+        return {
+            "ok": True,
+            "ttn": ttn,
+            "ref": doc_ref,
+            "estimatedCost": estimated_cost,
+            "deliveryDate": doc.get("EstimatedDeliveryDate", ""),
+        }
+
+    raise HTTPException(500, "Не вдалося створити ТТН")
+
+
+@app.post("/api/nova-poshta/track")
+async def np_track(request: Request):
+    """Track one or multiple TTN numbers."""
+    body = await request.json()
+    api_key = await _get_np_key()
+
+    ttns = body.get("ttns", [])
+    if isinstance(ttns, str):
+        ttns = [ttns]
+    if not ttns:
+        ttn = body.get("ttn", "")
+        if ttn:
+            ttns = [ttn]
+
+    if not ttns:
+        raise HTTPException(400, "Вкажіть номер ТТН для відстеження")
+
+    documents = [{"DocumentNumber": t, "Phone": ""} for t in ttns]
+
+    result = await _np_call(api_key, "TrackingDocument", "getStatusDocuments", {
+        "Documents": documents,
+    })
+
+    return [
+        {
+            "ttn": item.get("Number", ""),
+            "status": item.get("Status", ""),
+            "statusCode": item.get("StatusCode", ""),
+            "statusDescription": item.get("Status", ""),
+            "warehouseSender": item.get("WarehouseSender", ""),
+            "warehouseRecipient": item.get("WarehouseRecipient", ""),
+            "cityRecipient": item.get("CityRecipient", ""),
+            "recipientName": item.get("RecipientFullName", ""),
+            "scheduledDelivery": item.get("ScheduledDeliveryDate", ""),
+            "actualDelivery": item.get("ActualDeliveryDate", ""),
+            "weight": item.get("DocumentWeight", ""),
+            "cost": item.get("DocumentCost", ""),
+            "redeliverySum": item.get("RedeliverySum", ""),
+            "storagePrice": item.get("StoragePrice", ""),
+            "daysInStorage": item.get("DaysStorageCargo", ""),
+        }
+        for item in result
+    ]
+
+
+@app.post("/api/nova-poshta/estimate-cost")
+async def np_estimate_cost(request: Request):
+    """Estimate delivery cost."""
+    body = await request.json()
+    api_key = await _get_np_key()
+
+    np_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "nova_poshta"}, maybe_single=True,
+    )
+    val = np_settings.get("value", {}) if np_settings else {}
+
+    result = await _np_call(api_key, "InternetDocument", "getDocumentPrice", {
+        "CitySender": val.get("senderCityRef", ""),
+        "CityRecipient": body.get("recipientCityRef", ""),
+        "Weight": str(body.get("weight", "0.5")),
+        "ServiceType": "WarehouseWarehouse",
+        "Cost": str(body.get("cost", 500)),
+        "CargoType": "Parcel",
+        "SeatsAmount": "1",
+    })
+
+    if result:
+        return {
+            "cost": result[0].get("Cost", 0),
+            "estimatedDelivery": result[0].get("EstimatedDeliveryDate", ""),
+        }
+    return {"cost": 0, "estimatedDelivery": ""}
