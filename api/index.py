@@ -742,8 +742,32 @@ async def list_orders(status: str = "", limit: int = 50, offset: int = 0):
 
 @app.post("/api/orders")
 async def create_order(request: Request):
-    """Создать заказ."""
+    """Создать заказ + списать наличие со склада по размеру."""
     body = await request.json()
+
+    # Decrement stock_by_size immediately on order add
+    try:
+        pid = body.get("product_id")
+        size = body.get("size")
+        qty = int(body.get("quantity", 1) or 1)
+        if pid and size is not None:
+            prod = await db_select("products", filters={"id": pid}, maybe_single=True)
+            if prod:
+                sbs = prod.get("stock_by_size") or {}
+                if not isinstance(sbs, dict):
+                    sbs = {}
+                key = str(size)
+                cur = int(sbs.get(key, 0) or 0)
+                sbs[key] = max(0, cur - qty)
+                total = sum(int(v or 0) for v in sbs.values())
+                await db_update(
+                    "products",
+                    {"stock_by_size": sbs, "stock": total},
+                    {"id": pid},
+                )
+    except Exception as e:
+        print("[stock decrement] failed:", e)
+
     return await db_insert("orders", body)
 
 
@@ -815,17 +839,34 @@ async def create_product(request: Request):
     results = []
 
     for item in items:
+        # Compute total stock from stock_by_size if provided
+        sbs = item.get("stock_by_size") or {}
+        total_stock = item.get("stock", 0)
+        if isinstance(sbs, dict) and sbs:
+            try:
+                total_stock = sum(int(v or 0) for v in sbs.values())
+            except Exception:
+                pass
+
         row = {
             "name": item.get("name", ""),
             "sku": item.get("sku", ""),
             "category": item.get("category", ""),
             "price": item.get("price", 0),
             "cost": item.get("cost", 0),
-            "stock": item.get("stock", 0),
-            "sizes": json.dumps(item.get("sizes", [])),
+            "stock": total_stock,
+            "stock_by_size": sbs if isinstance(sbs, (dict, list)) else {},
+            "sizes": item.get("sizes", []),
             "gender": item.get("gender", "m"),
+            "season": item.get("season", "літо"),
+            "description": item.get("description", "") or item.get("sku", ""),
             "image_url": item.get("img", "") or item.get("image_url", ""),
             "photo": item.get("img", "") or item.get("photo", ""),
+            "weight": item.get("weight", 0),
+            "length": item.get("length", 0),
+            "width": item.get("width", 0),
+            "height": item.get("height", 0),
+            "properties": item.get("properties", []),
             "is_active": True,
         }
 
@@ -854,7 +895,8 @@ async def update_product(product_id: int, request: Request):
     field_map = {
         "name": "name", "sku": "sku", "category": "category",
         "price": "price", "cost": "cost", "stock": "stock",
-        "gender": "gender", "description": "description",
+        "gender": "gender", "description": "description", "season": "season",
+        "weight": "weight", "length": "length", "width": "width", "height": "height",
     }
     for frontend_key, db_key in field_map.items():
         if frontend_key in body:
@@ -865,7 +907,17 @@ async def update_product(product_id: int, request: Request):
     if "image_url" in body:
         row["image_url"] = body["image_url"]
     if "sizes" in body:
-        row["sizes"] = json.dumps(body["sizes"]) if isinstance(body["sizes"], list) else body["sizes"]
+        row["sizes"] = body["sizes"] if isinstance(body["sizes"], list) else json.loads(body["sizes"] or "[]")
+    if "stock_by_size" in body:
+        sbs = body["stock_by_size"] or {}
+        row["stock_by_size"] = sbs
+        if isinstance(sbs, dict) and sbs:
+            try:
+                row["stock"] = sum(int(v or 0) for v in sbs.values())
+            except Exception:
+                pass
+    if "properties" in body:
+        row["properties"] = body["properties"] or []
     if "is_active" in body:
         row["is_active"] = body["is_active"]
 
@@ -878,6 +930,43 @@ async def update_product(product_id: int, request: Request):
 async def delete_product(product_id: int):
     """Soft-delete a product (set is_active=false)."""
     return await db_update("products", {"is_active": False}, {"id": product_id})
+
+
+# ═══════════════════════════════════════
+#  API — PRODUCT PROPERTIES (Global dictionary)
+# ═══════════════════════════════════════
+
+@app.get("/api/product-properties")
+async def list_product_properties():
+    """List all property values from the global dictionary."""
+    return await db_select("product_properties", order="type.asc,value.asc")
+
+
+@app.post("/api/product-properties")
+async def create_product_property(request: Request):
+    """Add a new property value (or list of them)."""
+    body = await request.json()
+    items = body if isinstance(body, list) else [body]
+    rows = []
+    for it in items:
+        rows.append({
+            "type": (it.get("type") or "").strip(),
+            "value": (it.get("value") or "").strip(),
+            "label": (it.get("label") or it.get("value") or "").strip(),
+        })
+    rows = [r for r in rows if r["type"] and r["value"]]
+    if not rows:
+        return []
+    try:
+        return await db_insert("product_properties", rows if len(rows) > 1 else rows[0])
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.delete("/api/product-properties/{prop_id}")
+async def delete_product_property(prop_id: int):
+    """Remove a property value from the global dictionary."""
+    return await db_delete("product_properties", {"id": prop_id})
 
 
 # ═══════════════════════════════════════
