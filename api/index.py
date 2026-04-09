@@ -815,11 +815,37 @@ async def create_order(request: Request):
 
 @app.patch("/api/orders/{order_id}")
 async def update_order(order_id: int, request: Request):
-    """Обновить заказ."""
+    """Обновить заказ. Если изменился status — запускает автоматизации order_status_changed."""
     raw = await request.json()
     body = _normalize_order_payload(raw)
     body["updated_at"] = datetime.utcnow().isoformat()
-    return await db_update("orders", body, {"id": order_id})
+
+    # Определяем старый статус, чтобы понять, изменился ли он
+    old_status = None
+    if "status" in body:
+        try:
+            prev = await db_select("orders", filters={"id": order_id}, maybe_single=True)
+            if prev:
+                old_status = prev.get("status")
+        except Exception as e:
+            print(f"[update_order] failed to fetch old status: {e}")
+
+    result = await db_update("orders", body, {"id": order_id})
+
+    # Если статус реально изменился — фаерим триггер
+    try:
+        new_status = body.get("status")
+        if new_status and new_status != old_status:
+            await run_automations("order_status_changed", {
+                "order_id": order_id,
+                "old_status": old_status or "",
+                "new_status": new_status,
+                "conversation_id": (prev or {}).get("conversation_id") if old_status is not None else None,
+            })
+    except Exception as e:
+        print(f"[update_order] automation fire failed: {e}")
+
+    return result
 
 
 @app.post("/api/orders/{order_id}/notify")
@@ -1483,11 +1509,104 @@ async def delete_automation(auto_id: int):
     return {"status": "ok"} if resp.status_code in (200, 204) else {"status": "error"}
 
 
+# ═══════════════════════════════════════
+#  API — КОМАНДА (TEAM MEMBERS)
+# ═══════════════════════════════════════
+
+_TEAM_ALLOWED = {"name", "role", "telegram_user_id", "is_active"}
+
+
+@app.get("/api/team")
+async def list_team():
+    """Список усіх учасників команди."""
+    return await db_select("team_members", order="created_at.desc", limit=200)
+
+
+@app.post("/api/team")
+async def create_team_member(request: Request):
+    body = await request.json()
+    data = {k: v for k, v in (body or {}).items() if k in _TEAM_ALLOWED}
+    if not data.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    result = await db_insert("team_members", data)
+    if isinstance(result, list) and result:
+        return result[0]
+    return result
+
+
+@app.patch("/api/team/{member_id}")
+async def update_team_member(member_id: int, request: Request):
+    body = await request.json()
+    data = {k: v for k, v in (body or {}).items() if k in _TEAM_ALLOWED}
+    if not data:
+        return {"status": "noop"}
+    result = await db_update("team_members", data, {"id": member_id})
+    return result[0] if isinstance(result, list) and result else {"status": "ok"}
+
+
+@app.delete("/api/team/{member_id}")
+async def delete_team_member(member_id: int):
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{REST_URL}/team_members?id=eq.{member_id}",
+            headers=_h(),
+        )
+    return {"status": "ok"} if resp.status_code in (200, 204) else {"status": "error"}
+
+
+# ═══════════════════════════════════════
+#  API — ЗАДАЧІ (TASKS)
+# ═══════════════════════════════════════
+
+_TASK_ALLOWED = {"title", "description", "assignee_id", "order_id", "status", "deadline", "source"}
+
+
+@app.get("/api/tasks")
+async def list_tasks(status: str = "", limit: int = 200):
+    filters = {}
+    if status:
+        filters["status"] = status
+    return await db_select("tasks", filters=filters, order="created_at.desc", limit=limit)
+
+
+@app.post("/api/tasks")
+async def create_task(request: Request):
+    body = await request.json()
+    data = {k: v for k, v in (body or {}).items() if k in _TASK_ALLOWED}
+    if not data.get("title"):
+        raise HTTPException(status_code=400, detail="title is required")
+    data.setdefault("status", "open")
+    data.setdefault("source", "manual")
+    result = await db_insert("tasks", data)
+    if isinstance(result, list) and result:
+        return result[0]
+    return result
+
+
+@app.patch("/api/tasks/{task_id}")
+async def update_task(task_id: int, request: Request):
+    body = await request.json()
+    data = {k: v for k, v in (body or {}).items() if k in _TASK_ALLOWED}
+    data["updated_at"] = datetime.utcnow().isoformat()
+    result = await db_update("tasks", data, {"id": task_id})
+    return result[0] if isinstance(result, list) and result else {"status": "ok"}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: int):
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{REST_URL}/tasks?id=eq.{task_id}",
+            headers=_h(),
+        )
+    return {"status": "ok"} if resp.status_code in (200, 204) else {"status": "error"}
+
+
 async def run_automations(trigger_type: str, context: dict):
     """
     Execute matching automations.
-    trigger_type: 'funnel_change', 'new_message', 'payment_received', 'order_created'
-    context: {conversation_id, old_funnel, new_funnel, message_text, ...}
+    trigger_type: 'funnel_change', 'new_message', 'payment_received', 'order_created', 'order_status_changed'
+    context: {conversation_id, old_funnel, new_funnel, message_text, order_id, old_status, new_status, ...}
     """
     try:
         autos = await db_select(
@@ -1517,6 +1636,10 @@ async def run_automations(trigger_type: str, context: dict):
                 msg = context.get("message_text", "").lower()
                 if trigger_text.lower() in msg:
                     should_run = True
+            elif trigger_type == "order_status_changed":
+                # trigger_text = target order status id, e.g. "shipped"
+                if trigger_text and trigger_text == context.get("new_status", ""):
+                    should_run = True
             elif trigger_type in ("payment_received", "order_created"):
                 should_run = True  # Always fire for these triggers
 
@@ -1544,6 +1667,51 @@ async def run_automations(trigger_type: str, context: dict):
                         if tag not in tags:
                             tags.append(tag)
                             await db_update("conversations", {"tags": tags}, {"id": conv_id})
+                elif atype == "create_task":
+                    # action = {type:"create_task", assignee_id, title, notify_telegram?}
+                    try:
+                        assignee_id = action.get("assignee_id")
+                        title = (action.get("title") or "").strip()
+                        if not title:
+                            # Автозаголовок, если не указан
+                            if trigger_type == "order_status_changed":
+                                title = f"Замовлення #{context.get('order_id','')}: статус → {context.get('new_status','')}"
+                            else:
+                                title = f"Автозадача ({trigger_type})"
+                        task_row = {
+                            "title": title[:500],
+                            "description": action.get("description", "") or "",
+                            "assignee_id": int(assignee_id) if assignee_id else None,
+                            "order_id": context.get("order_id"),
+                            "status": "open",
+                            "source": "automation",
+                        }
+                        await db_insert("tasks", task_row)
+
+                        # Уведомляем сотрудника в Telegram (если задан telegram_user_id)
+                        if assignee_id:
+                            member = await db_select(
+                                "team_members",
+                                filters={"id": int(assignee_id)},
+                                maybe_single=True,
+                            )
+                            tg_id = (member or {}).get("telegram_user_id") or ""
+                            if tg_id:
+                                notify_text = f"📋 Нова задача\n{title}"
+                                if context.get("order_id"):
+                                    notify_text += f"\nЗамовлення #{context.get('order_id')}"
+                                try:
+                                    await db_insert("telegram_outbox", {
+                                        "telegram_user_id": str(tg_id),
+                                        "conversation_id": None,
+                                        "text": notify_text,
+                                        "media_url": "",
+                                        "status": "pending",
+                                    })
+                                except Exception as e:
+                                    print(f"[create_task] telegram notify failed: {e}")
+                    except Exception as e:
+                        print(f"[create_task] action failed: {e}")
 
             # Increment run count
             await db_update("automations", {
@@ -2834,3 +3002,15 @@ async def np_estimate_cost(request: Request):
             "estimatedDelivery": result[0].get("EstimatedDeliveryDate", ""),
         }
     return {"cost": 0, "estimatedDelivery": ""}
+
+
+# ═══════════════════════════════════════
+#  AI AGENT LAYER  (/api/agent/*)
+# ═══════════════════════════════════════
+# Тонкий gate + audit для Claude tool use.
+# Требует AGENT_API_TOKEN в env. См. api/agent.py и migrations/001_agent_tables.sql
+try:
+    from .agent import router as agent_router
+    app.include_router(agent_router)
+except Exception as _agent_err:
+    print(f"[agent router] not loaded: {_agent_err}")
