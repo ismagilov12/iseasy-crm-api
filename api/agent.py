@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import os
 import re
+import json
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
@@ -930,3 +932,217 @@ async def list_actions(limit: int = 50, authorization: Optional[str] = Header(No
         limit=limit,
     )
     return {"actions": rows}
+
+
+# ─────────────────────────────────────────────────────────────
+#  /chat — server-side Claude Opus tool loop
+# ─────────────────────────────────────────────────────────────
+_AGENT_DIR = Path(__file__).resolve().parent
+_TOOLS_CACHE: Optional[list] = None
+_SYSTEM_PROMPT_CACHE: Optional[str] = None
+
+_FALLBACK_SYSTEM_PROMPT = (
+    "Ты — AI-менеджер бренда обуви IS EASY. Работаешь внутри CRM и помогаешь "
+    "команде обрабатывать клиентов. Пиши кратко (2–3 предложения), по-украински, "
+    "без эмодзи (кроме 🙏 в конце благодарности). Используй инструменты вместо "
+    "догадок. Если не уверен — оставляй задачу через create_task. Финальный ответ "
+    "давай менеджеру (не клиенту) в формате отчёта."
+)
+
+
+def _load_agent_tools() -> list:
+    global _TOOLS_CACHE
+    if _TOOLS_CACHE is not None:
+        return _TOOLS_CACHE
+    path = _AGENT_DIR / "agent_tools.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "tools" in data:
+            data = data["tools"]
+        if not isinstance(data, list):
+            raise ValueError("agent_tools.json must be a list")
+        _TOOLS_CACHE = data
+    except Exception as e:
+        print(f"[agent._load_agent_tools] fallback (empty): {e}")
+        _TOOLS_CACHE = []
+    return _TOOLS_CACHE
+
+
+def _load_system_prompt() -> str:
+    global _SYSTEM_PROMPT_CACHE
+    if _SYSTEM_PROMPT_CACHE is not None:
+        return _SYSTEM_PROMPT_CACHE
+    path = _AGENT_DIR / "agent_system_prompt.md"
+    try:
+        _SYSTEM_PROMPT_CACHE = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[agent._load_system_prompt] fallback: {e}")
+        _SYSTEM_PROMPT_CACHE = _FALLBACK_SYSTEM_PROMPT
+    return _SYSTEM_PROMPT_CACHE
+
+
+async def _run_tool_internal(tool_name: str, params: dict) -> dict:
+    """
+    Общая логика выполнения инструмента (используется /execute и /chat).
+    Возвращает {status, result|pending_id|reason, message?, mode}.
+    Не бросает HTTPException — упаковывает ошибки в dict.
+    """
+    if tool_name not in TOOL_HANDLERS:
+        return {"status": "error", "error": f"Unknown tool: {tool_name}"}
+
+    mode, reason = resolve_mode(tool_name, params)
+
+    if mode == "confirm":
+        try:
+            pending = await enqueue_pending(
+                tool_name, params,
+                reason=reason or "always-confirm tool",
+                preview=_preview_for(tool_name, params),
+            )
+            await log_action(tool_name, params, mode, "pending", pending_id=pending.get("id"))
+            return {
+                "status": "pending",
+                "pending_id": pending.get("id"),
+                "reason": reason or "always-confirm tool",
+                "message": "Действие поставлено в очередь на подтверждение менеджером.",
+                "mode": mode,
+            }
+        except Exception as e:
+            await log_action(tool_name, params, mode, "failed", error=str(e))
+            return {"status": "error", "error": f"Enqueue failed: {e}", "mode": mode}
+
+    try:
+        result = await TOOL_HANDLERS[tool_name](params)
+        await log_action(tool_name, params, mode, "executed", result=result)
+        return {"status": "executed", "result": result, "mode": mode}
+    except HTTPException as e:
+        await log_action(tool_name, params, mode, "failed", error=str(e.detail))
+        return {"status": "error", "error": str(e.detail), "mode": mode}
+    except Exception as e:
+        await log_action(tool_name, params, mode, "failed", error=str(e))
+        return {"status": "error", "error": f"Tool failed: {e}", "mode": mode}
+
+
+@router.post("/chat")
+async def agent_chat(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Полный цикл общения с Claude Opus: сервер сам гоняет tool loop.
+    Тело: { "prompt": str, "model"?: str, "max_turns"?: int }
+    Ответ: { "final_text": str, "trace": [...], "turns_used": int, "usage": {...} }
+    """
+    _check_auth(authorization)
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not anthropic_key:
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY is not configured on the server",
+        )
+
+    try:
+        from anthropic import AsyncAnthropic
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="anthropic package not installed on backend",
+        )
+
+    body = await request.json()
+    prompt = (body.get("prompt") or body.get("message") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Empty prompt")
+
+    model = body.get("model") or os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
+    max_turns = int(body.get("max_turns") or os.getenv("MAX_AGENT_TURNS", "8"))
+    max_turns = max(1, min(max_turns, 16))
+
+    tools = _load_agent_tools()
+    system_prompt = _load_system_prompt()
+
+    client = AsyncAnthropic(api_key=anthropic_key)
+    messages: list[dict] = [{"role": "user", "content": prompt}]
+    trace: list[dict] = []
+    final_text = ""
+    total_in = 0
+    total_out = 0
+    turns_used = 0
+
+    for turn in range(max_turns):
+        turns_used = turn + 1
+        try:
+            resp = await client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system_prompt,
+                tools=tools,
+                messages=messages,
+            )
+        except Exception as e:
+            trace.append({"type": "error", "error": f"Claude API: {e}"})
+            raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+
+        try:
+            total_in += resp.usage.input_tokens or 0
+            total_out += resp.usage.output_tokens or 0
+        except Exception:
+            pass
+
+        assistant_blocks = resp.content or []
+        tool_uses = [b for b in assistant_blocks if getattr(b, "type", None) == "tool_use"]
+        text_blocks = [b for b in assistant_blocks if getattr(b, "type", None) == "text"]
+
+        for tb in text_blocks:
+            txt = getattr(tb, "text", "") or ""
+            if txt:
+                trace.append({"type": "text", "text": txt})
+                final_text = txt  # последний текстовый блок = финальный
+
+        if not tool_uses:
+            break
+
+        # Добавляем assistant turn с оригинальными блоками
+        serialized_assistant = []
+        for b in assistant_blocks:
+            btype = getattr(b, "type", None)
+            if btype == "text":
+                serialized_assistant.append({"type": "text", "text": getattr(b, "text", "")})
+            elif btype == "tool_use":
+                serialized_assistant.append({
+                    "type": "tool_use",
+                    "id": b.id,
+                    "name": b.name,
+                    "input": b.input,
+                })
+        messages.append({"role": "assistant", "content": serialized_assistant})
+
+        # Выполняем все tool_use блоки
+        tool_results: list[dict] = []
+        for tu in tool_uses:
+            tool_name = tu.name
+            tool_input = tu.input or {}
+            trace.append({
+                "type": "tool_use",
+                "name": tool_name,
+                "input": tool_input,
+            })
+            result = await _run_tool_internal(tool_name, tool_input)
+            trace.append({
+                "type": "tool_result",
+                "name": tool_name,
+                "result": result,
+            })
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tu.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return {
+        "final_text": final_text or "(модель не вернула текст)",
+        "trace": trace,
+        "turns_used": turns_used,
+        "usage": {"input_tokens": total_in, "output_tokens": total_out},
+        "model": model,
+    }
