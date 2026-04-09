@@ -1,0 +1,300 @@
+[
+  {
+    "name": "find_conversation",
+    "description": "Найти диалог в CRM по имени клиента, Instagram-username или телефону. Возвращает список диалогов с id, статусом, последним сообщением и привязанным client_id. Используй ПЕРЕД любыми действиями с конкретным клиентом, чтобы получить conversation_id и client_id.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "search": {"type": "string", "description": "Имя, фамилия, @username или номер телефона"},
+        "limit": {"type": "integer", "default": 5}
+      },
+      "required": ["search"]
+    }
+  },
+  {
+    "name": "get_conversation_messages",
+    "description": "Получить последние сообщения диалога. Используй чтобы понять контекст переписки перед ответом или оформлением заказа. Сообщения возвращаются в хронологическом порядке.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {"type": "integer"},
+        "limit": {"type": "integer", "default": 30}
+      },
+      "required": ["conversation_id"]
+    }
+  },
+  {
+    "name": "send_message_to_client",
+    "description": "Отправить ответ клиенту в Instagram. ВНИМАНИЕ: гибридный режим. Короткие нейтральные сообщения отправляются сразу, сообщения с ценами/обещаниями/возвратами уходят на подтверждение менеджеру. Не пиши конкретные суммы и сроки, если не уверен. Не извиняйся за компанию без согласования.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {"type": "integer"},
+        "text": {"type": "string", "description": "Текст ответа на украинском, дружелюбный тон бренда IS EASY"},
+        "intent": {
+          "type": "string",
+          "enum": ["greeting", "info", "size_check", "price_quote", "order_confirm", "delivery_info", "apology", "other"],
+          "description": "Категория сообщения — нужна для аудита и решения автоотправки"
+        }
+      },
+      "required": ["conversation_id", "text", "intent"]
+    }
+  },
+  {
+    "name": "update_conversation",
+    "description": "Изменить параметры диалога: воронку, статус, ответственного менеджера или теги. Используй чтобы двигать клиента по воронке (new → qualified → ordering → completed) или добавлять теги для сегментации.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {"type": "integer"},
+        "funnel": {"type": "string", "description": "new / qualified / ordering / paid / shipped / completed / lost"},
+        "status": {"type": "string", "description": "active / archived"},
+        "assigned_to": {"type": "string", "description": "Имя менеджера из team_members"},
+        "tags_add": {"type": "array", "items": {"type": "string"}},
+        "tags_remove": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["conversation_id"]
+    }
+  },
+  {
+    "name": "find_or_create_client",
+    "description": "Найти клиента по телефону или Instagram, иначе создать новую карточку. Возвращает client_id. Используй ПЕРЕД создание заказа, если клиента ещё нет в БД. Если из переписки известны только имя и город — этого достаточно.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "surname": {"type": "string"},
+        "phone": {"type": "string"},
+        "instagram_username": {"type": "string"},
+        "instagram_user_id": {"type": "string"},
+        "city": {"type": "string"},
+        "np_branch": {"type": "string"}
+      },
+      "required": ["name"]
+    }
+  },
+  {
+    "name": "update_client_card",
+    "description": "Дополнить карточку клиента данными из переписки: телефон, город, отделение НП, заметки, теги. Используй когда клиент сообщил новую информацию.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "client_id": {"type": "integer"},
+        "phone": {"type": "string"},
+        "city": {"type": "string"},
+        "np_branch": {"type": "string"},
+        "email": {"type": "string"},
+        "notes": {"type": "string"},
+        "tags_add": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["client_id"]
+    }
+  },
+  {
+    "name": "search_products",
+    "description": "Найти товары в каталоге по запросу клиента. Можно фильтровать по названию, категории, размеру, полу, наличию. Возвращает товары с ценами, остатками и доступными размерами.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "search": {"type": "string", "description": "Текст запроса (название, ключевое слово)"},
+        "category": {"type": "string"},
+        "size": {"type": "number"},
+        "gender": {"type": "string", "enum": ["f", "m", "u"]},
+        "in_stock_only": {"type": "boolean", "default": true}
+      }
+    }
+  },
+  {
+    "name": "get_product_availability",
+    "description": "Подробная информация о товаре: цена, остаток, размеры, картинка, описание. Используй ПЕРЕД создание заказа чтобы убедиться что нужный размер в наличии.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "product_id": {"type": "integer"}
+      },
+      "required": ["product_id"]
+    }
+  },
+  {
+    "name": "create_order",
+    "description": "Создать новый заказ. Гибридный режим: маленькие заказы клиентов из БД оформляются автоматически, большие/новые/нестандартные уходят на подтверждение. ОБЯЗАТЕЛЬНО сначала проверь наличие через get_product_availability и убедись что клиент существует через find_or_create_client.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "client_id": {"type": "integer"},
+        "conversation_id": {"type": "integer"},
+        "product_id": {"type": "integer"},
+        "size": {"type": "string"},
+        "quantity": {"type": "integer", "default": 1},
+        "price": {"type": "number", "description": "Цена за единицу. Если не указано — берётся из products"},
+        "order_type": {"type": "string", "enum": ["order", "exchange", "repair"], "default": "order"},
+        "payment_method": {"type": "string"},
+        "notes": {"type": "string"}
+      },
+      "required": ["client_id", "product_id", "size"]
+    }
+  },
+  {
+    "name": "update_order_status",
+    "description": "Сменить статус заказа. Auto: new→confirmed, confirmed→paid (если есть подтверждённая оплата). Confirm: shipped, delivered, cancelled, refunded, exchange, repair. Не перепрыгивай статусы — двигайся последовательно.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "integer"},
+        "new_status": {"type": "string", "enum": ["new", "confirmed", "paid", "shipped", "delivered", "cancelled", "refunded"]},
+        "reason": {"type": "string", "description": "Короткое объяснение почему меняем статус"}
+      },
+      "required": ["order_id", "new_status"]
+    }
+  },
+  {
+    "name": "update_order_details",
+    "description": "Изменить детали заказа: размер, количество, цену, заметки. Всегда требует подтверждения менеджера. Используй когда клиент попросил изменить размер до отправки или согласовали скидку.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "integer"},
+        "size": {"type": "string"},
+        "quantity": {"type": "integer"},
+        "price": {"type": "number"},
+        "notes": {"type": "string"},
+        "reason": {"type": "string"}
+      },
+      "required": ["order_id", "reason"]
+    }
+  },
+  {
+    "name": "notify_order_status",
+    "description": "Отправить клиенту шаблонное уведомление о текущем статусе заказа (например, 'оплата получена', 'заказ отправлен с ТТН XXX'). Шаблон выбирается автоматически по статусу.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "integer"}
+      },
+      "required": ["order_id"]
+    }
+  },
+  {
+    "name": "list_unmatched_payments",
+    "description": "Получить список входящих платежей (Monobank, WayForPay), которые ещё не привязаны к заказу. Используй когда нужно разобрать очередь оплат.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "limit": {"type": "integer", "default": 20}
+      }
+    }
+  },
+  {
+    "name": "suggest_payment_match",
+    "description": "Для конкретного неопознанного платежа найти заказы-кандидаты по сумме, имени плательщика и времени. Возвращает список с confidence-score для каждого кандидата.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "payment_id": {"type": "integer"}
+      },
+      "required": ["payment_id"]
+    }
+  },
+  {
+    "name": "match_payment_to_order",
+    "description": "Привязать платёж к заказу. Auto: только если сумма копейка-в-копейку И имя плательщика совпадает с клиентом. Иначе на подтверждение. После привязки заказ автоматически переходит в статус paid если сумма равна total.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "payment_id": {"type": "integer"},
+        "order_id": {"type": "integer"},
+        "confidence": {"type": "number", "description": "От 0 до 1, твоя уверенность в матче"}
+      },
+      "required": ["payment_id", "order_id", "confidence"]
+    }
+  },
+  {
+    "name": "np_resolve_city_warehouse",
+    "description": "Из вольного текста клиента ('Днепр, отделение 12' или 'Львов, поштомат на Стрыйской') получить точные city_ref и warehouse_ref Новой Пошты. Используй ПЕРЕД оценкой стоимости и созданием ТТН.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "city_text": {"type": "string"},
+        "warehouse_text": {"type": "string"}
+      },
+      "required": ["city_text"]
+    }
+  },
+  {
+    "name": "np_estimate_delivery_cost",
+    "description": "Посчитать стоимость доставки Новой Поштой до отправки. Полезно сообщить клиенту сумму к оплате.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "city_ref": {"type": "string"},
+        "weight_kg": {"type": "number", "default": 1},
+        "declared_value": {"type": "number"}
+      },
+      "required": ["city_ref", "declared_value"]
+    }
+  },
+  {
+    "name": "np_create_ttn",
+    "description": "Создать накладную (ТТН) Новой Поштой для заказа. ВСЕГДА требует подтверждения менеджера — это деньги и физическая отправка. Перед вызовом убедись что заказ в статусе paid и у клиента заполнены city/np_branch/phone.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "integer"},
+        "weight_kg": {"type": "number", "default": 1},
+        "payer": {"type": "string", "enum": ["sender", "recipient"], "default": "recipient"}
+      },
+      "required": ["order_id"]
+    }
+  },
+  {
+    "name": "np_track_ttn",
+    "description": "Узнать актуальный статус ТТН (в пути, прибыл в отделение, получен, возврат). Используй для проверки зависших отправлений.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "ttn": {"type": "string"}
+      },
+      "required": ["ttn"]
+    }
+  },
+  {
+    "name": "create_task",
+    "description": "Поставить задачу менеджеру. Используй когда клиент попросил перезвонить, нужно что-то проверить позже, или есть нестандартная ситуация которая требует человека.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "assignee_id": {"type": "integer", "description": "id из team_members"},
+        "order_id": {"type": "integer"},
+        "deadline": {"type": "string", "description": "ISO 8601 datetime"}
+      },
+      "required": ["title"]
+    }
+  },
+  {
+    "name": "get_stats",
+    "description": "Получить сводку по продажам, заказам и конверсиям за период. Используй для ответа на вопросы владельца про текущие показатели.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "period": {"type": "string", "enum": ["today", "yesterday", "week", "month"], "default": "today"}
+      }
+    }
+  },
+  {
+    "name": "propose_automation",
+    "description": "Предложить новое правило автоматизации. ВСЕГДА создаётся с is_active=false и требует подтверждения владельца. Не активируй сам.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "trigger_type": {"type": "string", "enum": ["keyword", "funnel_change", "time", "order_status_changed"]},
+        "trigger_text": {"type": "string"},
+        "actions": {"type": "array", "items": {"type": "object"}, "description": "Список действий в формате [{type, params}]"},
+        "rationale": {"type": "string", "description": "Зачем нужно это правило, какую боль решает"}
+      },
+      "required": ["name", "trigger_type", "actions", "rationale"]
+    }
+  }
+]
