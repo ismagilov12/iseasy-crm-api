@@ -517,7 +517,7 @@ async def list_conversations(
     limit: int = 50,
     offset: int = 0,
 ):
-    """Список разговоров для CRM-панели."""
+    """Список разговоров для CRM-панели. Включает привязанные заказы."""
     filters = {"status": status}
     if funnel:
         filters["funnel"] = funnel
@@ -530,6 +530,7 @@ async def list_conversations(
 
     return await db_select(
         "conversations",
+        columns="*,orders(*)",
         filters=filters,
         or_filter=or_filter,
         order="last_message_at.desc",
@@ -740,10 +741,47 @@ async def list_orders(status: str = "", limit: int = 50, offset: int = 0):
     )
 
 
+# Маппинг camelCase (frontend) → snake_case (БД)
+_ORDER_FIELD_MAP = {
+    "type": "order_type",
+    "npStatus": "np_status",
+    "daysAtPost": "days_at_post",
+    "returnTtn": "return_ttn",
+    "repairNote": "repair_note",
+    "repairPhotos": "repair_photos",
+    "paymentMethod": "payment_method",
+    "productId": "product_id",
+    "clientId": "client_id",
+    "conversationId": "conversation_id",
+}
+
+# Поля, реально существующие в таблице orders
+_ORDER_ALLOWED = {
+    "conversation_id", "client_id", "client", "product_id", "product_name",
+    "size", "quantity", "price", "total", "paid", "status", "order_type",
+    "ttn", "np_status", "days_at_post", "return_ttn", "repair_note",
+    "repair_photos", "payment_method", "notes",
+}
+
+
+def _normalize_order_payload(body: dict) -> dict:
+    """Приводит поля заказа к snake_case и отбрасывает неизвестные."""
+    out = {}
+    for k, v in (body or {}).items():
+        key = _ORDER_FIELD_MAP.get(k, k)
+        if key in _ORDER_ALLOWED:
+            out[key] = v
+    # size в БД — TEXT
+    if "size" in out and out["size"] is not None:
+        out["size"] = str(out["size"])
+    return out
+
+
 @app.post("/api/orders")
 async def create_order(request: Request):
     """Создать заказ + списать наличие со склада по размеру."""
-    body = await request.json()
+    raw = await request.json()
+    body = _normalize_order_payload(raw)
 
     # Decrement stock_by_size immediately on order add
     try:
@@ -768,13 +806,18 @@ async def create_order(request: Request):
     except Exception as e:
         print("[stock decrement] failed:", e)
 
-    return await db_insert("orders", body)
+    result = await db_insert("orders", body)
+    # Вернём единичный объект, а не список — фронту удобнее
+    if isinstance(result, list) and len(result) > 0:
+        return result[0]
+    return result
 
 
 @app.patch("/api/orders/{order_id}")
 async def update_order(order_id: int, request: Request):
     """Обновить заказ."""
-    body = await request.json()
+    raw = await request.json()
+    body = _normalize_order_payload(raw)
     body["updated_at"] = datetime.utcnow().isoformat()
     return await db_update("orders", body, {"id": order_id})
 
