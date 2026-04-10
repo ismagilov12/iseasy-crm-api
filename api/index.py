@@ -3237,138 +3237,114 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
 # ─────────────────────────────────────────────────────────────
 
 from fastapi.responses import HTMLResponse
+import textwrap
+
+_TEST_CHAT_HTML = None
+
+def _get_test_chat_html():
+    global _TEST_CHAT_HTML
+    if _TEST_CHAT_HTML:
+        return _TEST_CHAT_HTML
+    _TEST_CHAT_HTML = textwrap.dedent("""
+    <\!DOCTYPE html>
+    <html lang="uk">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IS EASY AI Agent Test</title>
+    <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:Inter,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;height:100vh;display:flex;flex-direction:column}
+    .hdr{background:#1e293b;padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #334155}
+    .hdr h1{font-size:18px;color:#818cf8;font-weight:700}
+    .badge{background:#4f46e5;color:#fff;font-size:11px;padding:3px 10px;border-radius:20px;font-weight:600}
+    .st{margin-left:auto;font-size:13px;color:#64748b}
+    .st.on{color:#4ade80}
+    .cfg{background:#1e293b;padding:10px 24px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #334155;font-size:13px;flex-wrap:wrap}
+    .cfg label{color:#94a3b8;font-weight:500}
+    .cfg input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 12px;border-radius:8px;font-size:13px}
+    .chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:12px}
+    .m{max-width:75%%;padding:14px 18px;border-radius:18px;font-size:14px;line-height:1.6;word-wrap:break-word}
+    .m.u{align-self:flex-end;background:#4f46e5;color:#fff;border-bottom-right-radius:4px}
+    .m.a{align-self:flex-start;background:#1e293b;border:1px solid #334155;border-bottom-left-radius:4px}
+    .m.a .lb{font-size:11px;color:#818cf8;font-weight:600;margin-bottom:6px}
+    .m.s{align-self:center;background:#334155;color:#94a3b8;font-size:12px;padding:8px 16px;border-radius:12px}
+    .m .tr{margin-top:10px;padding-top:10px;border-top:1px solid #33415580;font-size:11px;color:#64748b}
+    .m .tr div{padding:2px 0}
+    .m .mt{margin-top:8px;font-size:11px;color:#475569;display:flex;gap:12px;flex-wrap:wrap}
+    .ib{background:#1e293b;padding:16px 24px;display:flex;gap:12px;border-top:1px solid #334155}
+    .ib input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:14px 18px;border-radius:14px;font-size:15px;outline:none}
+    .ib input:focus{border-color:#4f46e5}
+    .ib button{background:#4f46e5;color:#fff;border:none;padding:14px 28px;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer}
+    .ib button:disabled{background:#475569;cursor:not-allowed}
+    .typ{align-self:flex-start;padding:14px 18px;background:#1e293b;border-radius:18px;border:1px solid #334155}
+    .dots{display:flex;gap:4px}
+    .dots span{width:8px;height:8px;background:#4f46e5;border-radius:50%%;animation:b .6s infinite alternate}
+    .dots span:nth-child(2){animation-delay:.15s}
+    .dots span:nth-child(3){animation-delay:.3s}
+    @keyframes b{from{transform:translateY(0)}to{transform:translateY(-6px)}}
+    .cb{background:none;border:1px solid #334155;color:#94a3b8;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px}
+    </style>
+    </head>
+    <body>
+    <div class="hdr"><h1>IS EASY AI Agent</h1><span class="badge">TEST</span><span class="st" id="st">Ready</span></div>
+    <div class="cfg">
+      <label>Token:</label><input type="text" id="tk" value="" placeholder="Agent API Token" style="width:280px">
+      <label>Client:</label><input type="text" id="cn" value="Test Client" style="width:150px">
+      <button class="cb" onclick="cc()">New</button>
+    </div>
+    <div class="chat" id="ch"></div>
+    <div class="ib">
+      <input type="text" id="inp" placeholder="Write as customer..." onkeydown="if(event.key==='Enter')snd()">
+      <button id="sb" onclick="snd()">Send</button>
+    </div>
+    <script type="text/javascript">
+    var API=location.origin,ch=document.getElementById('ch'),inp=document.getElementById('inp'),
+        sb=document.getElementById('sb'),st=document.getElementById('st'),
+        hist=[],sid='t_'+Date.now(),cid=null;
+    function am(r,t,x){var d=document.createElement('div');d.className='m '+r;
+      if(r==='a'){var h='<div class="lb">AI Agent</div>'+t.replace(/\n/g,'<br>');
+        if(x&&x.trace){h+='<div class="tr">';x.trace.forEach(function(t){
+          if(t.type==='tool_call')h+='<div style="color:#fbbf24">T: '+t.tool+'</div>';
+          else if(t.type==='error')h+='<div style="color:#f87171">E: '+t.error+'</div>';
+        });h+='</div>';}
+        if(x){h+='<div class="mt">';
+          if(x.conversation_id)h+='<span>Conv #'+x.conversation_id+'</span>';
+          if(x.turns_used)h+='<span>'+x.turns_used+' turns</span>';
+          if(x.usage)h+='<span>'+(x.usage.input_tokens||0)+'/'+(x.usage.output_tokens||0)+' tok</span>';
+          h+='</div>';}
+        d.innerHTML=h;}
+      else d.textContent=t;
+      ch.appendChild(d);ch.scrollTop=ch.scrollHeight;}
+    function st1(){var d=document.createElement('div');d.className='typ';d.id='typ';
+      d.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';
+      ch.appendChild(d);ch.scrollTop=ch.scrollHeight;}
+    function st0(){var e=document.getElementById('typ');if(e)e.remove();}
+    function snd(){var t=inp.value.trim();if(\!t)return;
+      var tk=document.getElementById('tk').value.trim(),cn=document.getElementById('cn').value.trim()||'Test';
+      if(\!tk){am('s','Enter Agent API Token');return;}
+      inp.value='';am('u',t);sb.disabled=true;st.textContent='Thinking...';st.className='st';st1();
+      var t0=Date.now();
+      fetch(API+'/api/test-chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk},
+        body:JSON.stringify({text:t,client_name:cn,session_id:sid})})
+      .then(function(r){st0();if(\!r.ok)return r.text().then(function(e){am('s','Error '+r.status+': '+e);st.textContent='Error';sb.disabled=false;});
+        return r.json().then(function(d){var s=((Date.now()-t0)/1000).toFixed(1);
+          if(d.conversation_id)cid=d.conversation_id;
+          if(d.error){am('s','Error: '+d.error);st.textContent='Error';sb.disabled=false;return;}
+          var txt=d.final_text||d.message||'(empty)';am('a',txt,d);
+          st.textContent='Ready ('+s+'s)';st.className='st on';sb.disabled=false;inp.focus();});
+      }).catch(function(e){st0();am('s','Connection error: '+e.message);st.textContent='Error';sb.disabled=false;});
+    }
+    function cc(){ch.innerHTML='';hist=[];sid='t_'+Date.now();cid=null;am('s','New dialog. Messages saved to CRM.');}
+    am('s','Test chat. Enter token and write as customer.');
+    inp.focus();
+    </script>
+    </body>
+    </html>
+    """).strip()
+    return _TEST_CHAT_HTML
+
 
 @app.get("/test-chat", response_class=HTMLResponse)
 async def test_chat_ui():
-    return """<\!DOCTYPE html>
-<html lang="uk">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IS EASY — Test AI Agent</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;height:100vh;display:flex;flex-direction:column}
-.header{background:#1e293b;padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #334155}
-.header h1{font-size:18px;color:#818cf8;font-weight:700}
-.header .badge{background:#4f46e5;color:#fff;font-size:11px;padding:3px 10px;border-radius:20px;font-weight:600}
-.header .status{margin-left:auto;font-size:13px;color:#64748b}
-.header .status.online{color:#4ade80}
-.config-bar{background:#1e293b;padding:10px 24px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #334155;font-size:13px;flex-wrap:wrap}
-.config-bar label{color:#94a3b8;font-weight:500}
-.config-bar input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 12px;border-radius:8px;font-size:13px}
-.chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:75%;padding:14px 18px;border-radius:18px;font-size:14px;line-height:1.6;word-wrap:break-word;animation:fadeIn .2s ease}
-.msg.user{align-self:flex-end;background:#4f46e5;color:#fff;border-bottom-right-radius:4px}
-.msg.agent{align-self:flex-start;background:#1e293b;color:#e2e8f0;border-bottom-left-radius:4px;border:1px solid #334155}
-.msg.agent .label{font-size:11px;color:#818cf8;font-weight:600;margin-bottom:6px}
-.msg.system{align-self:center;background:#334155;color:#94a3b8;font-size:12px;padding:8px 16px;border-radius:12px}
-.msg .trace{margin-top:10px;padding-top:10px;border-top:1px solid #33415580;font-size:11px;color:#64748b}
-.msg .trace div{padding:2px 0}
-.msg .trace .tool{color:#fbbf24}
-.msg .trace .ok{color:#4ade80}
-.msg .trace .err{color:#f87171}
-.msg .meta{margin-top:8px;font-size:11px;color:#475569;display:flex;gap:12px;flex-wrap:wrap}
-.input-bar{background:#1e293b;padding:16px 24px;display:flex;gap:12px;border-top:1px solid #334155}
-.input-bar input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:14px 18px;border-radius:14px;font-size:15px;outline:none;transition:border .2s}
-.input-bar input:focus{border-color:#4f46e5}
-.input-bar button{background:#4f46e5;color:#fff;border:none;padding:14px 28px;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer;transition:background .2s}
-.input-bar button:hover{background:#3730a3}
-.input-bar button:disabled{background:#475569;cursor:not-allowed}
-.typing{align-self:flex-start;padding:14px 18px;background:#1e293b;border-radius:18px;border-bottom-left-radius:4px;border:1px solid #334155}
-.typing .dots{display:flex;gap:4px}
-.typing .dots span{width:8px;height:8px;background:#4f46e5;border-radius:50%;animation:bounce .6s infinite alternate}
-.typing .dots span:nth-child(2){animation-delay:.15s}
-.typing .dots span:nth-child(3){animation-delay:.3s}
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-@keyframes bounce{from{transform:translateY(0)}to{transform:translateY(-6px)}}
-.clear-btn{background:none;border:1px solid #334155;color:#94a3b8;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;white-space:nowrap}
-.clear-btn:hover{background:#334155}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>IS EASY AI Agent</h1>
-  <span class="badge">TEST MODE</span>
-  <span class="status" id="status">Ready</span>
-</div>
-<div class="config-bar">
-  <label>Token:</label>
-  <input type="text" id="token" value="" placeholder="Agent API Token" style="width:280px">
-  <label>Client:</label>
-  <input type="text" id="clientName" value="Test Client" style="width:150px">
-  <button class="clear-btn" onclick="clearChat()">New dialog</button>
-</div>
-<div class="chat" id="chat"></div>
-<div class="input-bar">
-  <input type="text" id="input" placeholder="Write as customer..." onkeydown="if(event.key==='Enter'&&\!event.shiftKey)send()">
-  <button id="sendBtn" onclick="send()">Send</button>
-</div>
-<script>
-const API=window.location.origin;
-const chatEl=document.getElementById('chat');
-const inputEl=document.getElementById('input');
-const sendBtn=document.getElementById('sendBtn');
-const statusEl=document.getElementById('status');
-let history=[];
-let sessionId='test_'+Date.now();
-let conversationId=null;
-
-function addMsg(role,text,extra){
-  const div=document.createElement('div');
-  div.className='msg '+role;
-  if(role==='agent'){
-    let html='<div class="label">AI Agent</div>';
-    html+=text.replace(/\n/g,'<br>');
-    if(extra&&extra.trace&&extra.trace.length){
-      html+='<div class="trace">';
-      extra.trace.forEach(t=>{
-        if(t.type==='tool_call')html+='<div class="tool">T: '+t.tool+'</div>';
-        else if(t.type==='tool_result'){const p=typeof t.result==='string'?t.result.substring(0,80):JSON.stringify(t.result).substring(0,80);html+='<div class="ok">R: '+p+'</div>';}
-        else if(t.type==='error')html+='<div class="err">E: '+t.error+'</div>';
-      });
-      html+='</div>';
-    }
-    if(extra){
-      html+='<div class="meta">';
-      if(extra.conversation_id)html+='<span>Conv #'+extra.conversation_id+'</span>';
-      if(extra.turns_used)html+='<span>'+extra.turns_used+' turns</span>';
-      if(extra.usage)html+='<span>'+(extra.usage.input_tokens||0)+' in / '+(extra.usage.output_tokens||0)+' out</span>';
-      if(extra.model)html+='<span>'+extra.model+'</span>';
-      html+='</div>';
-    }
-    div.innerHTML=html;
-  }else{div.textContent=text;}
-  chatEl.appendChild(div);chatEl.scrollTop=chatEl.scrollHeight;
-}
-function showTyping(){const d=document.createElement('div');d.className='typing';d.id='typing';d.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';chatEl.appendChild(d);chatEl.scrollTop=chatEl.scrollHeight;}
-function hideTyping(){const e=document.getElementById('typing');if(e)e.remove();}
-
-async function send(){
-  const text=inputEl.value.trim();if(\!text)return;
-  const token=document.getElementById('token').value.trim();
-  const clientName=document.getElementById('clientName').value.trim()||'Test Client';
-  if(\!token){addMsg('system','Enter Agent API Token above');return;}
-  inputEl.value='';addMsg('user',text);history.push({role:'user',text});
-  sendBtn.disabled=true;statusEl.textContent='Agent thinking...';statusEl.className='status';showTyping();
-  const t0=Date.now();
-  try{
-    const r=await fetch(API+'/api/test-chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({text,client_name:clientName,session_id:sessionId})});
-    hideTyping();
-    if(\!r.ok){const e=await r.text();addMsg('system','Error '+r.status+': '+e);statusEl.textContent='Error '+r.status;sendBtn.disabled=false;return;}
-    const data=await r.json();const elapsed=((Date.now()-t0)/1000).toFixed(1);
-    if(data.conversation_id)conversationId=data.conversation_id;
-    if(data.error){addMsg('system','Agent error: '+data.error);statusEl.textContent='Error';sendBtn.disabled=false;return;}
-    const agentText=data.final_text||data.message||'(empty)';
-    addMsg('agent',agentText,data);history.push({role:'agent',text:agentText});
-    statusEl.textContent='Ready ('+elapsed+'s) Conv #'+(conversationId||'?');statusEl.className='status online';
-  }catch(e){hideTyping();addMsg('system','Connection error: '+e.message);statusEl.textContent='Error';}
-  sendBtn.disabled=false;inputEl.focus();
-}
-function clearChat(){chatEl.innerHTML='';history=[];sessionId='test_'+Date.now();conversationId=null;addMsg('system','New dialog started. Messages are saved to CRM database.');}
-addMsg('system','Test chat with full CRM integration. Messages and replies are saved to database.');
-addMsg('system','Enter Agent API Token and start typing as a customer.');
-inputEl.focus();
-<\/script>
-</body>
-</html>"""
+    return _get_test_chat_html()
