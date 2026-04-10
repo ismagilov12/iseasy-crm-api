@@ -3098,17 +3098,11 @@ async def maybe_agent_reply(sender_id: str, conversation_id: int, text: str):
 
 
 # ─────────────────────────────────────────────────────────────
-#  TEST CHAT — симуляция клиента для тестирования агента
+#  TEST CHAT API — POST /api/test-chat
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/api/test-chat")
 async def test_chat(request: Request, authorization: Optional[str] = Header(None)):
-    """
-    Симулирует входящее сообщение от тестового клиента.
-    Создаёт/находит conversation, сохраняет сообщение в БД,
-    вызывает агента, возвращает ответ.
-    Body: { "text": str, "client_name"?: str, "session_id"?: str }
-    """
     token = ""
     if authorization:
         token = authorization.replace("Bearer ", "").strip()
@@ -3121,16 +3115,11 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
     if not text:
         raise HTTPException(status_code=400, detail="Empty text")
 
-    client_name = body.get("client_name") or "Тестовий клієнт"
-    session_id = body.get("session_id") or "test_session_default"
-    test_ig_id = f"test_{session_id}"
+    client_name = body.get("client_name") or "Test Client"
+    session_id = body.get("session_id") or "test_default"
+    test_ig_id = "test_" + session_id
 
-    # 1. Найти или создать conversation
-    conv = await db_select(
-        "conversations",
-        filters={"instagram_user_id": test_ig_id},
-        maybe_single=True,
-    )
+    conv = await db_select("conversations", filters={"instagram_user_id": test_ig_id}, maybe_single=True)
 
     if conv:
         conversation_id = conv["id"]
@@ -3143,7 +3132,7 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
     else:
         new_conv = await db_insert("conversations", {
             "instagram_user_id": test_ig_id,
-            "instagram_username": f"test_{session_id[:8]}",
+            "instagram_username": "test_" + session_id[:8],
             "client_name": client_name,
             "avatar_url": "",
             "last_message_text": text[:200],
@@ -3152,53 +3141,43 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
         })
         conversation_id = new_conv[0]["id"]
 
-    # 2. Сохранить сообщение клиента
     await db_insert("messages", {
         "conversation_id": conversation_id,
-        "instagram_message_id": f"test_{int(datetime.utcnow().timestamp()*1000)}",
+        "instagram_message_id": "test_" + str(int(datetime.utcnow().timestamp() * 1000)),
         "direction": "incoming",
         "message_type": "text",
         "content": text,
     })
 
-    # 3. Вызвать агента
     if _run_agent_loop_internal is None:
         return {"error": "Agent module not loaded", "conversation_id": conversation_id}
 
     recent_msgs = await db_select(
-        "messages",
-        columns="direction,content,message_type,created_at",
-        filters={"conversation_id": conversation_id},
-        order="created_at.desc",
-        limit=10,
+        "messages", columns="direction,content,message_type,created_at",
+        filters={"conversation_id": conversation_id}, order="created_at.desc", limit=10,
     )
     recent_msgs = list(reversed(recent_msgs or []))
 
     conv_data = await db_select("conversations", filters={"id": conversation_id}, maybe_single=True)
-    ig_username = (conv_data or {}).get("instagram_username", "")
+    ig_user = (conv_data or {}).get("instagram_username", "")
     funnel = (conv_data or {}).get("funnel", "new")
 
-    context_lines = []
-    context_lines.append(f"Диалог #{conversation_id} | Клиент: {client_name} (@{ig_username}) | Воронка: {funnel}")
-    context_lines.append("Последние сообщения:")
+    lines = [f"Dialog #{conversation_id} | Client: {client_name} (@{ig_user}) | Funnel: {funnel}", "Recent messages:"]
     for m in recent_msgs:
-        direction = "Клиент" if m.get("direction") == "incoming" else "IS EASY"
-        content_m = m.get("content", "")[:300]
-        msg_type = m.get("message_type", "text")
-        if msg_type != "text" and not content_m:
-            content_m = f"[{msg_type}]"
-        context_lines.append(f"  {direction}: {content_m}")
+        d = "Client" if m.get("direction") == "incoming" else "IS EASY"
+        c = m.get("content", "")[:300]
+        t = m.get("message_type", "text")
+        if t != "text" and not c:
+            c = "[" + t + "]"
+        lines.append("  " + d + ": " + c)
+    lines.append("")
+    lines.append("New message from client: " + text)
+    lines.append("Process this message: identify intent, use tools, reply to client.")
 
-    context_lines.append(f"\nНовое сообщение от клиента: {text}")
-    context_lines.append("Обработай это сообщение: определи намерение, используй инструменты и ответь клиенту.")
-
-    prompt = "\n".join(context_lines)
+    prompt = chr(10).join(lines)
 
     try:
-        agent_settings = await db_select(
-            "bot_settings", columns="value",
-            filters={"key": "agent_config"}, maybe_single=True,
-        )
+        agent_settings = await db_select("bot_settings", columns="value", filters={"key": "agent_config"}, maybe_single=True)
         agent_cfg = (agent_settings or {}).get("value") or {}
     except Exception:
         agent_cfg = {}
@@ -3209,13 +3188,12 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
     try:
         result = await _run_agent_loop_internal(prompt, model=model, max_turns=max_turns)
         result["conversation_id"] = conversation_id
-        result["client_name"] = client_name
 
         agent_text = result.get("final_text", "")
         if agent_text:
             await db_insert("messages", {
                 "conversation_id": conversation_id,
-                "instagram_message_id": f"agent_{int(datetime.utcnow().timestamp()*1000)}",
+                "instagram_message_id": "agent_" + str(int(datetime.utcnow().timestamp() * 1000)),
                 "direction": "outgoing",
                 "message_type": "text",
                 "content": agent_text,
@@ -3223,128 +3201,65 @@ async def test_chat(request: Request, authorization: Optional[str] = Header(None
             await db_update("conversations", {
                 "last_message_text": agent_text[:200],
                 "last_message_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
             }, {"id": conversation_id})
-
         return result
     except Exception as e:
         return {"error": str(e), "conversation_id": conversation_id}
 
 
 
-# ─────────────────────────────────────────────────────────────
-#  TEST CHAT UI — HTML страница для тестирования агента
-# ─────────────────────────────────────────────────────────────
-
 from fastapi.responses import HTMLResponse
-import textwrap
-
-_TEST_CHAT_HTML = None
-
-def _get_test_chat_html():
-    global _TEST_CHAT_HTML
-    if _TEST_CHAT_HTML:
-        return _TEST_CHAT_HTML
-    _TEST_CHAT_HTML = textwrap.dedent("""
-    <\!DOCTYPE html>
-    <html lang="uk">
-    <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IS EASY AI Agent Test</title>
-    <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:Inter,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;height:100vh;display:flex;flex-direction:column}
-    .hdr{background:#1e293b;padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #334155}
-    .hdr h1{font-size:18px;color:#818cf8;font-weight:700}
-    .badge{background:#4f46e5;color:#fff;font-size:11px;padding:3px 10px;border-radius:20px;font-weight:600}
-    .st{margin-left:auto;font-size:13px;color:#64748b}
-    .st.on{color:#4ade80}
-    .cfg{background:#1e293b;padding:10px 24px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #334155;font-size:13px;flex-wrap:wrap}
-    .cfg label{color:#94a3b8;font-weight:500}
-    .cfg input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 12px;border-radius:8px;font-size:13px}
-    .chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:12px}
-    .m{max-width:75%%;padding:14px 18px;border-radius:18px;font-size:14px;line-height:1.6;word-wrap:break-word}
-    .m.u{align-self:flex-end;background:#4f46e5;color:#fff;border-bottom-right-radius:4px}
-    .m.a{align-self:flex-start;background:#1e293b;border:1px solid #334155;border-bottom-left-radius:4px}
-    .m.a .lb{font-size:11px;color:#818cf8;font-weight:600;margin-bottom:6px}
-    .m.s{align-self:center;background:#334155;color:#94a3b8;font-size:12px;padding:8px 16px;border-radius:12px}
-    .m .tr{margin-top:10px;padding-top:10px;border-top:1px solid #33415580;font-size:11px;color:#64748b}
-    .m .tr div{padding:2px 0}
-    .m .mt{margin-top:8px;font-size:11px;color:#475569;display:flex;gap:12px;flex-wrap:wrap}
-    .ib{background:#1e293b;padding:16px 24px;display:flex;gap:12px;border-top:1px solid #334155}
-    .ib input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:14px 18px;border-radius:14px;font-size:15px;outline:none}
-    .ib input:focus{border-color:#4f46e5}
-    .ib button{background:#4f46e5;color:#fff;border:none;padding:14px 28px;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer}
-    .ib button:disabled{background:#475569;cursor:not-allowed}
-    .typ{align-self:flex-start;padding:14px 18px;background:#1e293b;border-radius:18px;border:1px solid #334155}
-    .dots{display:flex;gap:4px}
-    .dots span{width:8px;height:8px;background:#4f46e5;border-radius:50%%;animation:b .6s infinite alternate}
-    .dots span:nth-child(2){animation-delay:.15s}
-    .dots span:nth-child(3){animation-delay:.3s}
-    @keyframes b{from{transform:translateY(0)}to{transform:translateY(-6px)}}
-    .cb{background:none;border:1px solid #334155;color:#94a3b8;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px}
-    </style>
-    </head>
-    <body>
-    <div class="hdr"><h1>IS EASY AI Agent</h1><span class="badge">TEST</span><span class="st" id="st">Ready</span></div>
-    <div class="cfg">
-      <label>Token:</label><input type="text" id="tk" value="" placeholder="Agent API Token" style="width:280px">
-      <label>Client:</label><input type="text" id="cn" value="Test Client" style="width:150px">
-      <button class="cb" onclick="cc()">New</button>
-    </div>
-    <div class="chat" id="ch"></div>
-    <div class="ib">
-      <input type="text" id="inp" placeholder="Write as customer..." onkeydown="if(event.key==='Enter')snd()">
-      <button id="sb" onclick="snd()">Send</button>
-    </div>
-    <script type="text/javascript">
-    var API=location.origin,ch=document.getElementById('ch'),inp=document.getElementById('inp'),
-        sb=document.getElementById('sb'),st=document.getElementById('st'),
-        hist=[],sid='t_'+Date.now(),cid=null;
-    function am(r,t,x){var d=document.createElement('div');d.className='m '+r;
-      if(r==='a'){var h='<div class="lb">AI Agent</div>'+t.replace(/\n/g,'<br>');
-        if(x&&x.trace){h+='<div class="tr">';x.trace.forEach(function(t){
-          if(t.type==='tool_call')h+='<div style="color:#fbbf24">T: '+t.tool+'</div>';
-          else if(t.type==='error')h+='<div style="color:#f87171">E: '+t.error+'</div>';
-        });h+='</div>';}
-        if(x){h+='<div class="mt">';
-          if(x.conversation_id)h+='<span>Conv #'+x.conversation_id+'</span>';
-          if(x.turns_used)h+='<span>'+x.turns_used+' turns</span>';
-          if(x.usage)h+='<span>'+(x.usage.input_tokens||0)+'/'+(x.usage.output_tokens||0)+' tok</span>';
-          h+='</div>';}
-        d.innerHTML=h;}
-      else d.textContent=t;
-      ch.appendChild(d);ch.scrollTop=ch.scrollHeight;}
-    function st1(){var d=document.createElement('div');d.className='typ';d.id='typ';
-      d.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';
-      ch.appendChild(d);ch.scrollTop=ch.scrollHeight;}
-    function st0(){var e=document.getElementById('typ');if(e)e.remove();}
-    function snd(){var t=inp.value.trim();if(\!t)return;
-      var tk=document.getElementById('tk').value.trim(),cn=document.getElementById('cn').value.trim()||'Test';
-      if(\!tk){am('s','Enter Agent API Token');return;}
-      inp.value='';am('u',t);sb.disabled=true;st.textContent='Thinking...';st.className='st';st1();
-      var t0=Date.now();
-      fetch(API+'/api/test-chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk},
-        body:JSON.stringify({text:t,client_name:cn,session_id:sid})})
-      .then(function(r){st0();if(\!r.ok)return r.text().then(function(e){am('s','Error '+r.status+': '+e);st.textContent='Error';sb.disabled=false;});
-        return r.json().then(function(d){var s=((Date.now()-t0)/1000).toFixed(1);
-          if(d.conversation_id)cid=d.conversation_id;
-          if(d.error){am('s','Error: '+d.error);st.textContent='Error';sb.disabled=false;return;}
-          var txt=d.final_text||d.message||'(empty)';am('a',txt,d);
-          st.textContent='Ready ('+s+'s)';st.className='st on';sb.disabled=false;inp.focus();});
-      }).catch(function(e){st0();am('s','Connection error: '+e.message);st.textContent='Error';sb.disabled=false;});
-    }
-    function cc(){ch.innerHTML='';hist=[];sid='t_'+Date.now();cid=null;am('s','New dialog. Messages saved to CRM.');}
-    am('s','Test chat. Enter token and write as customer.');
-    inp.focus();
-    </script>
-    </body>
-    </html>
-    """).strip()
-    return _TEST_CHAT_HTML
-
 
 @app.get("/test-chat", response_class=HTMLResponse)
-async def test_chat_ui():
-    return _get_test_chat_html()
+async def test_chat_page():
+    h = "<!DOCTYPE html><html><head><meta charset=utf-8><title>IS EASY Agent Test</title>"
+    h += "<style>*{margin:0;padding:0;box-sizing:border-box}"
+    h += "body{font-family:system-ui;background:#0f172a;color:#e2e8f0;height:100vh;display:flex;flex-direction:column}"
+    h += ".h{background:#1e293b;padding:14px 20px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #334155}"
+    h += ".h h1{font-size:17px;color:#818cf8}.h .b{background:#4f46e5;color:#fff;font-size:11px;padding:2px 8px;border-radius:12px}"
+    h += ".h .s{margin-left:auto;font-size:12px;color:#64748b}"
+    h += ".c{background:#1e293b;padding:8px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #334155;font-size:12px;flex-wrap:wrap}"
+    h += ".c label{color:#94a3b8}.c input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:5px 10px;border-radius:6px;font-size:12px}"
+    h += ".c button{background:none;border:1px solid #334155;color:#94a3b8;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px}"
+    h += "#ch{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:10px}"
+    h += ".m{max-width:75%;padding:12px 16px;border-radius:16px;font-size:14px;line-height:1.5}"
+    h += ".u{align-self:flex-end;background:#4f46e5;color:#fff;border-bottom-right-radius:4px}"
+    h += ".a{align-self:flex-start;background:#1e293b;border:1px solid #334155;border-bottom-left-radius:4px}"
+    h += ".sy{align-self:center;background:#334155;color:#94a3b8;font-size:11px;padding:6px 14px;border-radius:10px}"
+    h += ".lb{font-size:10px;color:#818cf8;font-weight:600;margin-bottom:4px}"
+    h += ".mt{margin-top:6px;font-size:10px;color:#475569;display:flex;gap:10px;flex-wrap:wrap}"
+    h += ".ib{background:#1e293b;padding:14px 20px;display:flex;gap:10px;border-top:1px solid #334155}"
+    h += ".ib input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:12px 16px;border-radius:12px;font-size:14px;outline:none}"
+    h += ".ib button{background:#4f46e5;color:#fff;border:none;padding:12px 24px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer}"
+    h += ".ib button:disabled{background:#475569}</style></head><body>"
+    h += "<div class=h><h1>IS EASY AI Agent</h1><span class=b>TEST</span><span class=s id=st>Ready</span></div>"
+    h += "<div class=c><label>Token:</label><input id=tk placeholder=\"Agent API Token\" style=width:240px>"
+    h += " <label>Name:</label><input id=cn value=\"Test Client\" style=width:120px>"
+    h += " <button onclick=nc()>New</button></div>"
+    h += "<div id=ch></div>"
+    h += "<div class=ib><input id=inp placeholder=\"Write as customer...\" onkeydown=\"if(event.key==='Enter')go()\">"
+    h += "<button id=sb onclick=go()>Send</button></div>"
+    h += "<script>"
+    h += "var A=location.origin,ch=document.getElementById('ch'),inp=document.getElementById('inp'),"
+    h += "sb=document.getElementById('sb'),st=document.getElementById('st'),sid='t_'+Date.now(),cid=null;"
+    h += "function am(r,t,x){var d=document.createElement('div');d.className='m '+r;"
+    h += "if(r==='a'){var v='<div class=lb>AI Agent</div>'+t.replace(/\\n/g,'<br>');"
+    h += "if(x){v+='<div class=mt>';if(x.conversation_id)v+='<span>Conv #'+x.conversation_id+'</span>';"
+    h += "if(x.turns_used)v+='<span>'+x.turns_used+' turns</span>';if(x.usage)v+='<span>'+(x.usage.input_tokens||0)+'/'+(x.usage.output_tokens||0)+'</span>';v+='</div>';}"
+    h += "d.innerHTML=v;}else d.textContent=t;ch.appendChild(d);ch.scrollTop=ch.scrollHeight;}"
+    h += "function go(){var t=inp.value.trim();if(!t)return;"
+    h += "var tk=document.getElementById('tk').value.trim();if(!tk){am('sy','Enter token');return;}"
+    h += "var cn=document.getElementById('cn').value.trim()||'Test';"
+    h += "inp.value='';am('u',t);sb.disabled=true;st.textContent='Thinking...';"
+    h += "fetch(A+'/api/test-chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk},"
+    h += "body:JSON.stringify({text:t,client_name:cn,session_id:sid})})"
+    h += ".then(function(r){if(!r.ok)return r.text().then(function(e){am('sy','Error '+r.status+': '+e);sb.disabled=false;st.textContent='Error';});"
+    h += "return r.json().then(function(d){if(d.conversation_id)cid=d.conversation_id;"
+    h += "if(d.error){am('sy','Error: '+d.error);sb.disabled=false;st.textContent='Error';return;}"
+    h += "am('a',d.final_text||'(empty)',d);sb.disabled=false;st.textContent='Ready';st.style.color='#4ade80';inp.focus();});})"
+    h += ".catch(function(e){am('sy','Error: '+e.message);sb.disabled=false;st.textContent='Error';});"
+    h += "}"
+    h += "function nc(){ch.innerHTML='';sid='t_'+Date.now();cid=null;am('sy','New dialog');}"
+    h += "am('sy','Enter Agent API Token and write as customer');"
+    h += "</script></body></html>"
+    return h
