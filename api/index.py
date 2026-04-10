@@ -3094,3 +3094,138 @@ async def maybe_agent_reply(sender_id: str, conversation_id: int, text: str):
         print(f"[agent_reply] ERROR conv={conversation_id}: {e}")
         # Fallback: шаблонный автоответ если агент упал
         await maybe_auto_reply(sender_id, conversation_id)
+
+
+
+# ─────────────────────────────────────────────────────────────
+#  TEST CHAT — симуляция клиента для тестирования агента
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/test-chat")
+async def test_chat(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Симулирует входящее сообщение от тестового клиента.
+    Создаёт/находит conversation, сохраняет сообщение в БД,
+    вызывает агента, возвращает ответ.
+    Body: { "text": str, "client_name"?: str, "session_id"?: str }
+    """
+    token = ""
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+    agent_token = os.environ.get("AGENT_API_TOKEN", "").strip()
+    if agent_token and token != agent_token:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    client_name = body.get("client_name") or "Тестовий клієнт"
+    session_id = body.get("session_id") or "test_session_default"
+    test_ig_id = f"test_{session_id}"
+
+    # 1. Найти или создать conversation
+    conv = await db_select(
+        "conversations",
+        filters={"instagram_user_id": test_ig_id},
+        maybe_single=True,
+    )
+
+    if conv:
+        conversation_id = conv["id"]
+        await db_update("conversations", {
+            "last_message_text": text[:200],
+            "last_message_at": datetime.utcnow().isoformat(),
+            "unread_count": conv.get("unread_count", 0) + 1,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, {"id": conversation_id})
+    else:
+        new_conv = await db_insert("conversations", {
+            "instagram_user_id": test_ig_id,
+            "instagram_username": f"test_{session_id[:8]}",
+            "client_name": client_name,
+            "avatar_url": "",
+            "last_message_text": text[:200],
+            "last_message_at": datetime.utcnow().isoformat(),
+            "unread_count": 1,
+        })
+        conversation_id = new_conv[0]["id"]
+
+    # 2. Сохранить сообщение клиента
+    await db_insert("messages", {
+        "conversation_id": conversation_id,
+        "instagram_message_id": f"test_{int(datetime.utcnow().timestamp()*1000)}",
+        "direction": "incoming",
+        "message_type": "text",
+        "content": text,
+    })
+
+    # 3. Вызвать агента
+    if _run_agent_loop_internal is None:
+        return {"error": "Agent module not loaded", "conversation_id": conversation_id}
+
+    recent_msgs = await db_select(
+        "messages",
+        columns="direction,content,message_type,created_at",
+        filters={"conversation_id": conversation_id},
+        order="created_at.desc",
+        limit=10,
+    )
+    recent_msgs = list(reversed(recent_msgs or []))
+
+    conv_data = await db_select("conversations", filters={"id": conversation_id}, maybe_single=True)
+    ig_username = (conv_data or {}).get("instagram_username", "")
+    funnel = (conv_data or {}).get("funnel", "new")
+
+    context_lines = []
+    context_lines.append(f"Диалог #{conversation_id} | Клиент: {client_name} (@{ig_username}) | Воронка: {funnel}")
+    context_lines.append("Последние сообщения:")
+    for m in recent_msgs:
+        direction = "Клиент" if m.get("direction") == "incoming" else "IS EASY"
+        content_m = m.get("content", "")[:300]
+        msg_type = m.get("message_type", "text")
+        if msg_type != "text" and not content_m:
+            content_m = f"[{msg_type}]"
+        context_lines.append(f"  {direction}: {content_m}")
+
+    context_lines.append(f"\nНовое сообщение от клиента: {text}")
+    context_lines.append("Обработай это сообщение: определи намерение, используй инструменты и ответь клиенту.")
+
+    prompt = "\n".join(context_lines)
+
+    try:
+        agent_settings = await db_select(
+            "bot_settings", columns="value",
+            filters={"key": "agent_config"}, maybe_single=True,
+        )
+        agent_cfg = (agent_settings or {}).get("value") or {}
+    except Exception:
+        agent_cfg = {}
+
+    model = agent_cfg.get("model", "claude-sonnet-4-20250514")
+    max_turns = int(agent_cfg.get("max_turns", 6))
+
+    try:
+        result = await _run_agent_loop_internal(prompt, model=model, max_turns=max_turns)
+        result["conversation_id"] = conversation_id
+        result["client_name"] = client_name
+
+        agent_text = result.get("final_text", "")
+        if agent_text:
+            await db_insert("messages", {
+                "conversation_id": conversation_id,
+                "instagram_message_id": f"agent_{int(datetime.utcnow().timestamp()*1000)}",
+                "direction": "outgoing",
+                "message_type": "text",
+                "content": agent_text,
+            })
+            await db_update("conversations", {
+                "last_message_text": agent_text[:200],
+                "last_message_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }, {"id": conversation_id})
+
+        return result
+    except Exception as e:
+        return {"error": str(e), "conversation_id": conversation_id}
