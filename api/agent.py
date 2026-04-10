@@ -1023,37 +1023,31 @@ async def _run_tool_internal(tool_name: str, params: dict) -> dict:
         return {"status": "error", "error": f"Tool failed: {e}", "mode": mode}
 
 
-@router.post("/chat")
-async def agent_chat(request: Request, authorization: Optional[str] = Header(None)):
+async def _run_agent_loop_internal(
+    prompt: str,
+    model: str = "",
+    max_turns: int = 8,
+) -> dict:
     """
-    Полный цикл общения с Claude Opus: сервер сам гоняет tool loop.
-    Тело: { "prompt": str, "model"?: str, "max_turns"?: int }
-    Ответ: { "final_text": str, "trace": [...], "turns_used": int, "usage": {...} }
+    Внутренний вызов Claude tool loop (без HTTP, без auth).
+    Используется из:
+      - POST /api/agent/chat (HTTP endpoint)
+      - maybe_agent_reply()   (автоответ из webhook)
+    Возвращает: {final_text, trace, turns_used, usage, model}
     """
-    _check_auth(authorization)
-
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not anthropic_key:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured on the server",
-        )
+        return {"final_text": "", "trace": [{"type": "error", "error": "ANTHROPIC_API_KEY not set"}],
+                "turns_used": 0, "usage": {}, "model": ""}
 
     try:
         from anthropic import AsyncAnthropic
     except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="anthropic package not installed on backend",
-        )
+        return {"final_text": "", "trace": [{"type": "error", "error": "anthropic not installed"}],
+                "turns_used": 0, "usage": {}, "model": ""}
 
-    body = await request.json()
-    prompt = (body.get("prompt") or body.get("message") or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Empty prompt")
-
-    model = body.get("model") or os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
-    max_turns = int(body.get("max_turns") or os.getenv("MAX_AGENT_TURNS", "8"))
+    if not model:
+        model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
     max_turns = max(1, min(max_turns, 16))
 
     tools = _load_agent_tools()
@@ -1079,7 +1073,7 @@ async def agent_chat(request: Request, authorization: Optional[str] = Header(Non
             )
         except Exception as e:
             trace.append({"type": "error", "error": f"Claude API: {e}"})
-            raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+            break
 
         try:
             total_in += resp.usage.input_tokens or 0
@@ -1095,12 +1089,11 @@ async def agent_chat(request: Request, authorization: Optional[str] = Header(Non
             txt = getattr(tb, "text", "") or ""
             if txt:
                 trace.append({"type": "text", "text": txt})
-                final_text = txt  # последний текстовый блок = финальный
+                final_text = txt
 
         if not tool_uses:
             break
 
-        # Добавляем assistant turn с оригинальными блоками
         serialized_assistant = []
         for b in assistant_blocks:
             btype = getattr(b, "type", None)
@@ -1115,7 +1108,6 @@ async def agent_chat(request: Request, authorization: Optional[str] = Header(Non
                 })
         messages.append({"role": "assistant", "content": serialized_assistant})
 
-        # Выполняем все tool_use блоки
         tool_results: list[dict] = []
         for tu in tool_uses:
             tool_name = tu.name
@@ -1146,3 +1138,19 @@ async def agent_chat(request: Request, authorization: Optional[str] = Header(Non
         "usage": {"input_tokens": total_in, "output_tokens": total_out},
         "model": model,
     }
+
+
+@router.post("/chat")
+async def agent_chat(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    HTTP endpoint для Claude tool loop.
+    Тело: { "prompt": str, "model"?: str, "max_turns"?: int }
+    """
+    _check_auth(authorization)
+
+    body = await request.json()
+    prompt = (body.get("prompt") or body.get("message") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Empty prompt")
+
+    model = body.get("mode
