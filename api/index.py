@@ -386,7 +386,7 @@ async def process_incoming_message(sender_id: str, message: dict):
 
     await db_insert("messages", msg_data)
 
-    await maybe_auto_reply(sender_id, conversation_id)
+    await maybe_agent_reply(sender_id, conversation_id, text)
 
 
 async def get_instagram_profile(user_id: str) -> dict:
@@ -3010,7 +3010,87 @@ async def np_estimate_cost(request: Request):
 # Тонкий gate + audit для Claude tool use.
 # Требует AGENT_API_TOKEN в env. См. api/agent.py и migrations/001_agent_tables.sql
 try:
-    from .agent import router as agent_router
+    from .agent import router as agent_router, _run_agent_loop_internal
     app.include_router(agent_router)
 except Exception as _agent_err:
     print(f"[agent router] not loaded: {_agent_err}")
+    _run_agent_loop_internal = None
+
+
+# ═══════════════════════════════════════
+#  AI AGENT: auto-reply from Instagram webhook
+# ═══════════════════════════════════════
+
+async def maybe_agent_reply(sender_id: str, conversation_id: int, text: str):
+    """
+    Вызывается из process_incoming_message ВМЕСТО maybe_auto_reply.
+    Логика:
+      1. Проверяет настройку agent_enabled в bot_settings
+      2. Если агент выключен → fallback на шаблонный maybe_auto_reply
+      3. Если агент включён → собирает контекст → вызывает Claude loop
+      4. Агент сам решает: отвечать (auto), pending, или create_task
+    """
+    # Проверяем настройки агента
+    agent_settings = await db_select(
+        "bot_settings", columns="value",
+        filters={"key": "agent_config"}, maybe_single=True,
+    )
+    agent_cfg = (agent_settings or {}).get("value") or {}
+
+    if not agent_cfg.get("enabled", False):
+        # Агент выключен — старый шаблонный автоответ
+        await maybe_auto_reply(sender_id, conversation_id)
+        return
+
+    if _run_agent_loop_internal is None:
+        print("[agent_reply] agent module not loaded, fallback to auto_reply")
+        await maybe_auto_reply(sender_id, conversation_id)
+        return
+
+    # Собираем контекст для агента
+    # Последние сообщения диалога
+    recent_msgs = await db_select(
+        "messages",
+        columns="direction,content,message_type,created_at",
+        filters={"conversation_id": conversation_id},
+        order="created_at.desc",
+        limit=10,
+    )
+    recent_msgs = list(reversed(recent_msgs or []))
+
+    # Данные клиента
+    conv = await db_select("conversations", filters={"id": conversation_id}, maybe_single=True)
+    client_name = (conv or {}).get("client_name", "")
+    ig_username = (conv or {}).get("instagram_username", "")
+    funnel = (conv or {}).get("funnel", "new")
+
+    # Формируем промпт с контекстом
+    context_lines = []
+    context_lines.append(f"Диалог #{conversation_id} | Клиент: {client_name} (@{ig_username}) | Воронка: {funnel}")
+    context_lines.append("Последние сообщения:")
+    for m in recent_msgs:
+        direction = "Клиент" if m.get("direction") == "incoming" else "IS EASY"
+        content = m.get("content", "")[:300]
+        msg_type = m.get("message_type", "text")
+        if msg_type != "text" and not content:
+            content = f"[{msg_type}]"
+        context_lines.append(f"  {direction}: {content}")
+
+    context_lines.append(f"\nНовое сообщение от клиента: {text}")
+    context_lines.append("Обработай это сообщение: определи намерение, используй инструменты и ответь клиенту.")
+
+    prompt = "\n".join(context_lines)
+
+    # Параметры из настроек
+    model = agent_cfg.get("model", "claude-sonnet-4-20250514")
+    max_turns = int(agent_cfg.get("max_turns", 6))
+
+    try:
+        result = await _run_agent_loop_internal(prompt, model=model, max_turns=max_turns)
+        print(f"[agent_reply] conv={conversation_id} turns={result.get('turns_used')} "
+              f"tokens_in={result.get('usage',{}).get('input_tokens',0)} "
+              f"tokens_out={result.get('usage',{}).get('output_tokens',0)}")
+    except Exception as e:
+        print(f"[agent_reply] ERROR conv={conversation_id}: {e}")
+        # Fallback: шаблонный автоответ если агент упал
+        await maybe_auto_reply(sender_id, conversation_id)
