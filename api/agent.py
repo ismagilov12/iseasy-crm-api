@@ -1153,4 +1153,78 @@ async def agent_chat(request: Request, authorization: Optional[str] = Header(Non
     if not prompt:
         raise HTTPException(status_code=400, detail="Empty prompt")
 
-    model = body.get("mode
+    model = body.get("model") or os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+    max_turns = int(body.get("max_turns") or os.getenv("MAX_AGENT_TURNS", "8"))
+
+    result = await _run_agent_loop_internal(prompt, model=model, max_turns=max_turns)
+
+    # Если была ошибка API — вернуть 502
+    for t in result.get("trace", []):
+        if t.get("type") == "error" and "Claude API" in t.get("error", ""):
+            raise HTTPException(status_code=502, detail=t["error"])
+        if t.get("type") == "error" and "not set" in t.get("error", ""):
+            raise HTTPException(status_code=503, detail=t["error"])
+        if t.get("type") == "error" and "not installed" in t.get("error", ""):
+            raise HTTPException(status_code=503, detail=t["error"])
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+#  /config — настройки агента (вкл/выкл, лимиты, модель)
+# ─────────────────────────────────────────────────────────────
+
+_DEFAULT_AGENT_CONFIG = {
+    "enabled": False,
+    "model": "claude-sonnet-4-20250514",
+    "max_turns": 6,
+    "order_auto_max_uah": 2000,
+    "order_auto_max_qty": 2,
+    "message_auto_max_len": 250,
+    "payment_auto_min_conf": 0.95,
+    "risky_words": ["грн", "uah", "скид", "повернен", "возвр", "гарант",
+                    "обіц", "обеша", "компенс", "вибач", "извин"],
+}
+
+
+@router.get("/config")
+async def get_agent_config(authorization: Optional[str] = Header(None)):
+    """Получить текущие настройки агента."""
+    _check_auth(authorization)
+    try:
+        row = await db_select(
+            "bot_settings", columns="value",
+            filters={"key": "agent_config"}, maybe_single=True,
+        )
+        cfg = (row or {}).get("value") or {}
+        merged = {**_DEFAULT_AGENT_CONFIG, **cfg}
+        return {"config": merged}
+    except Exception:
+        return {"config": {**_DEFAULT_AGENT_CONFIG}}
+
+
+@router.put("/config")
+async def put_agent_config(request: Request, authorization: Optional[str] = Header(None)):
+    """Обновить настройки агента (partial merge)."""
+    _check_auth(authorization)
+    body = await request.json()
+
+    # Получить текущие
+    try:
+        row = await db_select(
+            "bot_settings", columns="value",
+            filters={"key": "agent_config"}, maybe_single=True,
+        )
+        current = (row or {}).get("value") or {}
+    except Exception:
+        current = {}
+
+    merged = {**_DEFAULT_AGENT_CONFIG, **current, **body}
+
+    # Сохранить
+    await db_upsert("bot_settings", {
+        "key": "agent_config",
+        "value": merged,
+    }, on_conflict="key")
+
+    return {"ok": True, "config": merged}
